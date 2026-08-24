@@ -16,20 +16,22 @@ Kein Systemgerät (kein v4l2loopback), sondern eine Appliance. Warum, und wie
 das Timing funktioniert, steht in [docs/architecture.md](docs/architecture.md).
 Installation: [docs/setup-linux.md](docs/setup-linux.md).
 
-## Schnellstart
-
-Setzt voraus, dass MTL/DPDK schon steht und eine VF an vfio-pci gebunden ist —
-sonst erst [docs/setup-linux.md](docs/setup-linux.md) von vorn.
+## Installation
 
 ```bash
-cmake -B build && cmake --build build -j
-sudo cmake --install build
-sudo ./build/st2110-vcard --write-default-config /etc/st2110-vcard.json
-sudo $EDITOR /etc/st2110-vcard.json   # VF-BDF, IPs, Multicast-Gruppen
-sudo ./build/st2110-vcard -c /etc/st2110-vcard.json -v
+./install.sh                              # zeigt nur an, was schon da ist
+./install.sh --simple --iface enp3s0f0    # minimal, kein Reboot
+./install.sh --full --pf 0000:4b:00.0     # volles Pacing auf E810
 ```
 
-GUI auf `http://<host>:8088`.
+`--simple` nutzt MTLs Kernel-Datenpfad: kein IOMMU, kein vfio, kein gepatchter
+NIC-Treiber, beliebige NIC. Dafür kein ST 2110-21 Narrow Pacing — gut für
+Bring-up und 1080p-Tests, nicht für den Betrieb. Umstieg auf `--full` später
+ist ein Config-Feld, kein Neubau.
+
+Details und der Weg von Hand: [docs/setup-linux.md](docs/setup-linux.md).
+
+GUI danach auf `http://<host>:8088`.
 
 ## API
 

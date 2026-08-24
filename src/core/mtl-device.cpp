@@ -59,14 +59,32 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 	snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", params.port.c_str());
 	p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(p.port[MTL_PORT_P]);
 	p.net_proto[MTL_PORT_P] = MTL_PROTO_STATIC;
-	if (!parse_ip(params.local_ip, p.sip_addr[MTL_PORT_P])) {
-		VLOG_E("[mtl] invalid local IP '%s'", params.local_ip.c_str());
-		return;
+
+	/* On the kernel and AF_XDP backends the interface still belongs to the
+	 * kernel, so MTL reads the address off it -- configuring one here would
+	 * only be a second place to get it wrong. Those backends also give up
+	 * hardware pacing, which is the whole point of ST 2110-21, so say so
+	 * loudly rather than let someone ship a facility on it. */
+	const bool kernel_path = p.pmd[MTL_PORT_P] == MTL_PMD_KERNEL_SOCKET ||
+				 p.pmd[MTL_PORT_P] == MTL_PMD_NATIVE_AF_XDP;
+	if (kernel_path) {
+		VLOG_W("[mtl] '%s' uses the kernel data path: no ST 2110-21 narrow "
+		       "pacing, limited bandwidth. Fine for bring-up and 1080p "
+		       "tests, not for a facility.", params.port.c_str());
+		if (!params.local_ip.empty())
+			VLOG_I("[mtl] ignoring local_ip '%s' -- the address comes "
+			       "from the interface on this backend",
+			       params.local_ip.c_str());
+	} else {
+		if (!parse_ip(params.local_ip, p.sip_addr[MTL_PORT_P])) {
+			VLOG_E("[mtl] invalid local IP '%s'", params.local_ip.c_str());
+			return;
+		}
+		if (!params.netmask.empty())
+			parse_ip(params.netmask, p.netmask[MTL_PORT_P]);
+		if (!params.gateway.empty())
+			parse_ip(params.gateway, p.gateway[MTL_PORT_P]);
 	}
-	if (!params.netmask.empty())
-		parse_ip(params.netmask, p.netmask[MTL_PORT_P]);
-	if (!params.gateway.empty())
-		parse_ip(params.gateway, p.gateway[MTL_PORT_P]);
 	p.tx_queues_cnt[MTL_PORT_P] = params.tx_queues;
 	p.rx_queues_cnt[MTL_PORT_P] = params.rx_queues;
 	p.num_ports = 1;
@@ -76,13 +94,16 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 			 params.port_r.c_str());
 		p.pmd[MTL_PORT_R] = mtl_pmd_by_port_name(p.port[MTL_PORT_R]);
 		p.net_proto[MTL_PORT_R] = MTL_PROTO_STATIC;
-		if (!parse_ip(params.local_ip_r, p.sip_addr[MTL_PORT_R])) {
-			VLOG_E("[mtl] invalid redundant local IP '%s'",
-			       params.local_ip_r.c_str());
-			return;
+		if (p.pmd[MTL_PORT_R] != MTL_PMD_KERNEL_SOCKET &&
+		    p.pmd[MTL_PORT_R] != MTL_PMD_NATIVE_AF_XDP) {
+			if (!parse_ip(params.local_ip_r, p.sip_addr[MTL_PORT_R])) {
+				VLOG_E("[mtl] invalid redundant local IP '%s'",
+				       params.local_ip_r.c_str());
+				return;
+			}
+			if (!params.netmask.empty())
+				parse_ip(params.netmask, p.netmask[MTL_PORT_R]);
 		}
-		if (!params.netmask.empty())
-			parse_ip(params.netmask, p.netmask[MTL_PORT_R]);
 		p.tx_queues_cnt[MTL_PORT_R] = params.tx_queues;
 		p.rx_queues_cnt[MTL_PORT_R] = params.rx_queues;
 		p.num_ports = 2;
@@ -130,8 +151,8 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 		       params.port.c_str());
 		return;
 	}
-	VLOG_I("[mtl] up on %s (ip %s%s), clock source: %s", params.port.c_str(),
-	       params.local_ip.c_str(),
+	VLOG_I("[mtl] up on %s (%s%s), clock source: %s", params.port.c_str(),
+	       kernel_path ? "kernel data path" : params.local_ip.c_str(),
 	       params.port_r.empty() ? "" : ", 2022-7 redundant",
 	       clock_source_name().c_str());
 }

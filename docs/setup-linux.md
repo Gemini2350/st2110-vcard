@@ -1,11 +1,63 @@
 # Installation auf dem Linux-Host
 
+## Der kurze Weg
+
+```bash
+cd st2110-vcard
+./install.sh                                   # zeigt nur an, was schon da ist
+./install.sh --simple --iface enp3s0f0         # minimal, kein Reboot
+```
+
+`install.sh` prüft den Ist-Zustand, installiert nur was fehlt, baut MTL und
+den Daemon, reserviert Hugepages dauerhaft und schreibt eine passende
+`/etc/st2110-vcard.json`. Mehrfach ausführbar — jeder Schritt prüft erst, ob
+er schon erledigt ist.
+
+### Zwei Modi
+
+| | `--simple` | `--full` |
+|---|---|---|
+| Datenpfad | MTL Kernel-Socket | DPDK PMD auf E810-VF |
+| IOMMU / VT-d | nicht nötig | **nötig**, mit Reboot |
+| Gepatchter ice-Treiber | nicht nötig | **nötig**, nach jedem Kernel-Update neu |
+| VF-Binding an vfio-pci | nicht nötig | nötig |
+| NIC | beliebig, mit IP | E810/E830 |
+| ST 2110-21 Narrow Pacing | **nein** | ja |
+| Sinnvoll für | Bring-up, Funktionstest, 1080p | echter Betrieb, UHD |
+
+`--simple` überspringt die drei Schritte, die tatsächlich weh tun, und braucht
+keinen Reboot:
+
+```bash
+./install.sh --simple --iface enp3s0f0
+```
+
+Das reicht, um Files auf eine Multicast-Gruppe zu spielen, eingehendes Video
+anzusehen und aufzunehmen. Was fehlt, ist die harte Paketverteilung im Frame —
+der Kernel-Pfad hält kein Narrow Pacing, und ein 2110-Analyzer wird das
+anmerken. Für „läuft die Kette überhaupt" ist das egal, für eine Abnahme nicht.
+
+Später umsteigen geht ohne Neubau: `--full` laufen lassen und in der Config
+`device.port` von `kernel:enp3s0f0` auf die VF-BDF ändern.
+
+```bash
+./install.sh --full --pf 0000:4b:00.0
+```
+
+Der Rest dieses Dokuments beschreibt dieselben Schritte von Hand — zum
+Nachvollziehen und zur Fehlersuche, wenn das Script irgendwo abbricht.
+
+---
+
+# Von Hand
+
 Gegen Ubuntu 24.04 mit Intel E810 geschrieben. Die Schritte 1–5 sind reines
 MTL-Setup und identisch zu dem, was `obs-mtl-st2110` braucht — wer das auf der
 Kiste schon durchhat, springt direkt zu **6. st2110-vcard bauen**.
 
 Reihenfolge einhalten: 1–3 brauchen je einen Reboot bzw. einen Treiber-Neubau,
-und ohne sie schlägt `mtl_init` fehl.
+und ohne sie schlägt `mtl_init` fehl. **Für `--simple` entfallen 1, 3 und 5** —
+dort genügt eine NIC mit IP, Hugepages und `"port": "kernel:<ifname>"`.
 
 ---
 
