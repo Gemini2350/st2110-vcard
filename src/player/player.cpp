@@ -43,6 +43,29 @@ void copy_to_st_frame(const VideoFrame &src, struct st_frame *dst)
 	}
 }
 
+/* Narrow pacing needs the NIC's rate limiter, which in MTL means an E810/E830
+ * on the DPDK PMD. Everywhere else MTL falls back to TSC pacing, which is wide
+ * -- so the SDP has to say wide. */
+enum st21_pacing resolve_pacing(const std::string &configured, bool kernel_path)
+{
+	if (configured == "narrow")
+		return ST21_PACING_NARROW;
+	if (configured == "wide")
+		return ST21_PACING_WIDE;
+	if (configured == "linear")
+		return ST21_PACING_LINEAR;
+	return kernel_path ? ST21_PACING_WIDE : ST21_PACING_NARROW;
+}
+
+const char *pacing_name(enum st21_pacing p)
+{
+	switch (p) {
+	case ST21_PACING_WIDE: return "wide";
+	case ST21_PACING_LINEAR: return "linear";
+	default: return "narrow";
+	}
+}
+
 } // namespace
 
 Player::Player(PlayerConfig config)
@@ -154,7 +177,8 @@ bool Player::start_sessions()
 		vops.interlaced = config_.interlaced;
 		vops.input_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
 		vops.transport_fmt = ST20_FMT_YUV_422_10BIT;
-		vops.transport_pacing = ST21_PACING_NARROW;
+		vops.transport_pacing = resolve_pacing(config_.pacing,
+						       dev->kernel_data_path());
 		vops.transport_packing = ST20_PACKING_BPM;
 		vops.device = ST_PLUGIN_DEVICE_AUTO;
 		vops.framebuff_cnt = 3;
@@ -220,12 +244,14 @@ bool Player::start_sessions()
 		}
 	}
 
-	VLOG_I("[play:%s] senders up: video %s:%u pt%u %ux%u%s, audio %s:%u pt%u %uch %s",
+	VLOG_I("[play:%s] senders up: video %s:%u pt%u %ux%u%s %s pacing, "
+	       "audio %s:%u pt%u %uch %s",
 	       config_.name.c_str(), config_.video_dest_ip.c_str(), config_.video_port,
 	       config_.video_payload_type, config_.width, config_.height,
-	       mtl_fps_name(config_.fps), config_.audio_dest_ip.c_str(),
-	       config_.audio_port, config_.audio_payload_type, config_.channels,
-	       ptime_name(config_.ptime));
+	       mtl_fps_name(config_.fps),
+	       pacing_name(resolve_pacing(config_.pacing, dev->kernel_data_path())),
+	       config_.audio_dest_ip.c_str(), config_.audio_port,
+	       config_.audio_payload_type, config_.channels, ptime_name(config_.ptime));
 	return true;
 }
 

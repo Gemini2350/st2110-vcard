@@ -45,6 +45,7 @@ PlayerConfig parse_player(const json &j)
 	p.height = get_or<uint32_t>(j, "height", p.height);
 	p.fps = fps_from_string(get_or<std::string>(j, "fps", "50"));
 	p.interlaced = get_or<bool>(j, "interlaced", p.interlaced);
+	p.pacing = get_or<std::string>(j, "pacing", p.pacing);
 	p.video_enabled = get_or<bool>(j, "video_enabled", p.video_enabled);
 	p.video_dest_ip = get_or<std::string>(j, "video_dest_ip", p.video_dest_ip);
 	p.video_port = get_or<uint16_t>(j, "video_port", p.video_port);
@@ -68,6 +69,7 @@ json dump_player(const PlayerConfig &p)
 		    {"height", p.height},
 		    {"fps", mtl_fps_name(p.fps)},
 		    {"interlaced", p.interlaced},
+		    {"pacing", p.pacing},
 		    {"video_enabled", p.video_enabled},
 		    {"video_dest_ip", p.video_dest_ip},
 		    {"video_port", p.video_port},

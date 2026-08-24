@@ -37,6 +37,12 @@ struct PlayerConfig {
 	enum st_fps fps = ST_FPS_P50;
 	bool interlaced = false;
 
+	/* What the sender declares in the SDP (TP=2110TPN / TPW / TPNL).
+	 * Empty or "auto" picks narrow on a DPDK PMD and wide on the kernel
+	 * data path -- declaring narrow while MTL paces from the TSC would put
+	 * a claim in the SDP that the stream does not keep. */
+	std::string pacing = "auto";
+
 	/* video transport */
 	std::string video_dest_ip = "239.100.0.10";
 	uint16_t video_port = 20000;

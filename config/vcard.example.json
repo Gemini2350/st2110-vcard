@@ -39,6 +39,7 @@
       "height": 1080,
       "fps": "50",
       "interlaced": false,
+      "pacing": "auto",
       "video_enabled": true,
       "video_dest_ip": "239.100.0.10",
       "video_port": 20000,

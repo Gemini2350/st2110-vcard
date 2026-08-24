@@ -105,6 +105,29 @@ Draht geht bzw. von ihm kommt.
 Audio wird immer als PCM 24 bit geschrieben – das ist ein Broadcast-Recorder,
 kein Videoplayer.
 
+## Hardware: was die NIC bestimmt
+
+Nur **eine** Eigenschaft hängt wirklich an der Karte: ST 2110-21 **Narrow
+Pacing** braucht den Hardware-Rate-Limiter, und den nutzt MTL ausschließlich auf
+Intel E810/E830 über den DPDK-PMD (deshalb die Patches im ice-Treiber). Überall
+sonst — andere DPDK-NICs, Kernel-Socket, AF_XDP — pact MTL über den TSC, und das
+ist *wide*.
+
+Deshalb ist `pacing` in der Player-Config kein fester Wert: `"auto"` deklariert
+narrow auf dem DPDK-Pfad und wide auf dem Kernel-Pfad. Ein fest verdrahtetes
+`TP=2110TPN` im SDP wäre auf anderer Hardware schlicht gelogen, und genau darauf
+verlässt sich ein Empfänger beim Dimensionieren seines Puffers.
+
+Für alles andere ist die NIC egal:
+
+| Aufgabe | Anforderung |
+|---|---|
+| Empfangen, Aufnehmen, Monitoring | beliebige NIC mit genug Durchsatz — hier gibt es kein Pacing |
+| Senden, das ein Analyzer als konform abnimmt | E810/E830 + DPDK-PMD |
+| Senden für Funktionstests | beliebige NIC, wide pacing, die meisten Empfänger locken trotzdem |
+| PTP | NIC mit Hardware-Timestamping (PHC); bei allen Server-NICs dieser Klasse gegeben |
+| UHD | 25G+ und DPDK — der Kernel-Pfad trägt das nicht |
+
 ## Bekannte Lücken (bewusst v0)
 
 * **ST 2110-40 (ANC/Timecode)** fehlt. Für eine „echte" Karte gehört LTC/ST 12-2

@@ -51,6 +51,11 @@ public:
 	bool redundant() const { return !params_.port_r.empty(); }
 	int num_ports() const { return redundant() ? 2 : 1; }
 
+	/* True on the kernel socket / AF_XDP backends. Those have no hardware
+	 * rate limiter, so MTL paces from the TSC and the stream cannot honestly
+	 * be declared narrow (ST 2110-21 TP=2110TPN). */
+	bool kernel_data_path() const { return kernel_data_path_; }
+
 	/* Current PTP time in nanoseconds (TAI). 0 if unavailable. */
 	uint64_t ptp_time_ns() const;
 
@@ -72,6 +77,7 @@ private:
 
 	mtl_handle handle_ = nullptr;
 	Params params_;
+	bool kernel_data_path_ = false;
 };
 
 } // namespace vcard

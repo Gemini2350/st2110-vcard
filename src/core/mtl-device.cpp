@@ -65,8 +65,9 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 	 * only be a second place to get it wrong. Those backends also give up
 	 * hardware pacing, which is the whole point of ST 2110-21, so say so
 	 * loudly rather than let someone ship a facility on it. */
-	const bool kernel_path = p.pmd[MTL_PORT_P] == MTL_PMD_KERNEL_SOCKET ||
-				 p.pmd[MTL_PORT_P] == MTL_PMD_NATIVE_AF_XDP;
+	kernel_data_path_ = p.pmd[MTL_PORT_P] == MTL_PMD_KERNEL_SOCKET ||
+			    p.pmd[MTL_PORT_P] == MTL_PMD_NATIVE_AF_XDP;
+	const bool kernel_path = kernel_data_path_;
 	if (kernel_path) {
 		VLOG_W("[mtl] '%s' uses the kernel data path: no ST 2110-21 narrow "
 		       "pacing, limited bandwidth. Fine for bring-up and 1080p "
