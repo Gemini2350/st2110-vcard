@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ST 2110 Virtual Card</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>ST 2110 Virtual Card</h1>
+  <div id="device" class="device">
+    <span class="pill" id="pill-device">Device</span>
+    <span class="pill" id="pill-ptp">PTP</span>
+    <span class="pill" id="pill-nmos">NMOS</span>
+    <span class="tai" id="tai"></span>
+  </div>
+</header>
+
+<main>
+  <section id="players"></section>
+  <section id="recorders"></section>
+
+  <section class="panel">
+    <h2>Medien <small id="media-dir"></small></h2>
+    <table class="files">
+      <thead><tr><th>Datei</th><th>Format</th><th>Dauer</th><th>Größe</th><th></th></tr></thead>
+      <tbody id="media-list"></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Aufnahmen</h2>
+    <table class="files">
+      <thead><tr><th>Datei</th><th>Größe</th></tr></thead>
+      <tbody id="recording-list"></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

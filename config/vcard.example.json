@@ -1,0 +1,80 @@
+{
+  "log_level": "info",
+  "media_dir": "/var/lib/st2110-vcard/media",
+
+  "device": {
+    "port": "0000:4b:01.0",
+    "local_ip": "192.168.96.10",
+    "netmask": "255.255.255.0",
+    "gateway": "",
+    "port_r": "",
+    "local_ip_r": "",
+    "lcores": "",
+    "ptp": true,
+    "phc_device": "",
+    "tx_queues": 16,
+    "rx_queues": 16
+  },
+
+  "http": {
+    "bind": "0.0.0.0",
+    "port": 8088,
+    "web_root": "/usr/share/st2110-vcard/web"
+  },
+
+  "nmos": {
+    "enabled": true,
+    "label": "ST 2110 Virtual Card",
+    "description": "File playout and capture",
+    "host_address": "10.0.0.20",
+    "registry_address": "registry.example.com",
+    "registry_port": 8010,
+    "http_port": 0
+  },
+
+  "players": [
+    {
+      "name": "player1",
+      "width": 1920,
+      "height": 1080,
+      "fps": "50",
+      "interlaced": false,
+      "video_enabled": true,
+      "video_dest_ip": "239.100.0.10",
+      "video_port": 20000,
+      "video_payload_type": 96,
+      "audio_enabled": true,
+      "channels": 2,
+      "audio_dest_ip": "239.100.0.11",
+      "audio_port": 30000,
+      "audio_payload_type": 97,
+      "ptime": "1ms",
+      "queue_frames": 8
+    }
+  ],
+
+  "recorders": [
+    {
+      "name": "recorder1",
+      "auto_detect": true,
+      "width": 1920,
+      "height": 1080,
+      "fps": "50",
+      "video_enabled": true,
+      "video_source_ip": "",
+      "video_multicast_ip": "239.100.0.20",
+      "video_port": 20000,
+      "video_payload_type": 96,
+      "audio_enabled": true,
+      "channels": 2,
+      "audio_source_ip": "",
+      "audio_multicast_ip": "239.100.0.21",
+      "audio_port": 30000,
+      "audio_payload_type": 97,
+      "ptime": "1ms",
+      "output_dir": "/var/lib/st2110-vcard/recordings",
+      "codec": "prores422hq",
+      "queue_frames": 12
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=ST 2110 Virtual Card
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/st2110-vcard -c /etc/st2110-vcard.json
+Restart=on-failure
+RestartSec=5
+# DPDK needs hugepages, locked memory and access to vfio
+LimitMEMLOCK=infinity
+# MTL binds threads to the NIC's NUMA node; do not let the scheduler undo that
+CPUSchedulingPolicy=other
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target
