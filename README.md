@@ -18,11 +18,15 @@ Installation: [docs/setup-linux.md](docs/setup-linux.md).
 
 ## Schnellstart
 
+Setzt voraus, dass MTL/DPDK schon steht und eine VF an vfio-pci gebunden ist —
+sonst erst [docs/setup-linux.md](docs/setup-linux.md) von vorn.
+
 ```bash
 cmake -B build && cmake --build build -j
+sudo cmake --install build
 sudo ./build/st2110-vcard --write-default-config /etc/st2110-vcard.json
-sudo $EDITOR /etc/st2110-vcard.json
-sudo ./build/st2110-vcard -c /etc/st2110-vcard.json
+sudo $EDITOR /etc/st2110-vcard.json   # VF-BDF, IPs, Multicast-Gruppen
+sudo ./build/st2110-vcard -c /etc/st2110-vcard.json -v
 ```
 
 GUI auf `http://<host>:8088`.
