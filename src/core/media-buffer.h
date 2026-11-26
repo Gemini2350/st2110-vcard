@@ -90,6 +90,20 @@ public:
 		return true;
 	}
 
+	/* Non-blocking: returns false when there is nothing to take. The
+	 * transmit threads use only this -- a paced thread that waits on the
+	 * queue is a paced thread that misses its epoch. */
+	bool try_pop(T &out)
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (q_.empty())
+			return false;
+		out = std::move(q_.front());
+		q_.pop_front();
+		not_full_.notify_one();
+		return true;
+	}
+
 	/* Non-blocking peek at fill level, for the status API. */
 	size_t size() const
 	{
@@ -182,10 +196,13 @@ public:
 	 * Never blocks. It is called from the audio tx thread, which MTL has
 	 * already paced; waiting here for a slow decoder would push the whole
 	 * stream late instead of dropping the one thing that is missing. */
-	bool read_exact(uint8_t *dst, size_t len, bool *underrun)
+	bool read_exact(uint8_t *dst, size_t len, bool *underrun,
+			size_t *missing = nullptr)
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		size_t have = std::min(len, used_);
+		if (missing)
+			*missing = len - have;
 		for (size_t i = 0; i < have; i++) {
 			dst[i] = buf_[tail_];
 			tail_ = (tail_ + 1) % buf_.size();
@@ -200,12 +217,36 @@ public:
 		return true;
 	}
 
+	/* Throws away up to len bytes from the read side; returns how many. */
+	size_t discard(size_t len)
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		size_t n = std::min(len, used_);
+		tail_ = (tail_ + n) % buf_.size();
+		used_ -= n;
+		if (n)
+			not_full_.notify_all();
+		return n;
+	}
+
+	void clear()
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		head_ = tail_ = used_ = 0;
+		not_full_.notify_all();
+	}
+
 	size_t size() const
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		return used_;
 	}
 	size_t capacity() const { return capacity_; }
+	size_t free_space() const
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		return capacity_ - used_;
+	}
 
 	void stop()
 	{

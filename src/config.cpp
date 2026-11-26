@@ -59,6 +59,7 @@ PlayerConfig parse_player(const json &j)
 		get_or<uint8_t>(j, "audio_payload_type", p.audio_payload_type);
 	p.ptime = parse_ptime(get_or<std::string>(j, "ptime", "1ms"));
 	p.queue_frames = get_or<uint32_t>(j, "queue_frames", p.queue_frames);
+	p.av_offset_ms = get_or<int>(j, "av_offset_ms", p.av_offset_ms);
 	return p;
 }
 
@@ -80,7 +81,8 @@ json dump_player(const PlayerConfig &p)
 		    {"audio_port", p.audio_port},
 		    {"audio_payload_type", p.audio_payload_type},
 		    {"ptime", ptime_name(p.ptime)},
-		    {"queue_frames", p.queue_frames}};
+		    {"queue_frames", p.queue_frames},
+		    {"av_offset_ms", p.av_offset_ms}};
 }
 
 RecorderConfig parse_recorder(const json &j)

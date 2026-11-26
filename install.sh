@@ -187,6 +187,21 @@ else
 	[ -n "$LOCAL_IP" ] || die "$IFACE has no IPv4 address -- give it one first"
 	PORT="kernel:$IFACE"
 	ok "$IFACE ($LOCAL_IP), kernel data path"
+	# On this path the kernel still owns the NIC, so PTP is ptp4l's job and
+	# MTL reads the NIC clock it disciplines. MTL's own PTP client is meant
+	# for the DPDK path.
+	PHC=$(ethtool -T "$IFACE" 2>/dev/null | awk '/PTP Hardware Clock:/{print $4}')
+	if [ -n "$PHC" ] && [ "$PHC" != none ] && [ -e "/dev/ptp$PHC" ]; then
+		PHC_DEV="/dev/ptp$PHC"
+		if pgrep -x ptp4l >/dev/null 2>&1; then
+			ok "PTP: ptp4l is running, using $PHC_DEV"
+		else
+			warn "PTP: using $PHC_DEV, but ptp4l is not running -- start it:  ${SUDO} ptp4l -i $IFACE -m -s"
+		fi
+	else
+		PHC_DEV=""
+		warn "PTP: $IFACE has no hardware clock; timing will be free-running"
+	fi
 fi
 
 # ---------------------------------------------------------------- build
@@ -209,7 +224,11 @@ if [ -f "$CONFIG" ]; then
 	warn "$CONFIG exists, leaving it alone"
 else
 	say "Writing $CONFIG"
+	PTP_BUILTIN=true
+	[ "$MODE" = simple ] && PTP_BUILTIN=false
 	$SUDO sed -e "s|\"port\": \"0000:4b:01.0\"|\"port\": \"$PORT\"|" \
+		 -e "s|\"ptp\": true|\"ptp\": $PTP_BUILTIN|" \
+		 -e "s|\"phc_device\": \"\"|\"phc_device\": \"${PHC_DEV:-}\"|" \
 		 -e "s|\"local_ip\": \"192.168.96.10\"|\"local_ip\": \"$LOCAL_IP\"|" \
 		 -e "s|\"host_address\": \"10.0.0.20\"|\"host_address\": \"$MGMT_IP\"|" \
 		 config/vcard.example.json | $SUDO tee "$CONFIG" >/dev/null

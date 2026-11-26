@@ -5,6 +5,8 @@
 #include "core/log.h"
 #include "core/mtl-device.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <pthread.h>
 
@@ -147,6 +149,12 @@ bool Player::start_sessions()
 		return false;
 	}
 
+	/* fresh sessions, fresh bookkeeping for the done callbacks */
+	v_put_seq_ = v_done_seq_ = v_anchor_seq_ = 0;
+	a_put_seq_ = a_done_seq_ = a_anchor_seq_ = 0;
+	v_last_done_tai_ = a_last_done_tai_ = 0;
+	v_anchor_tai_ = a_anchor_tai_ = 0;
+
 	if (config_.video_enabled) {
 		struct st20p_tx_ops vops;
 		memset(&vops, 0, sizeof(vops));
@@ -185,6 +193,7 @@ bool Player::start_sessions()
 		/* BLOCK_GET is what makes MTL the clock: get_frame returns once
 		 * per epoch instead of returning NULL when nothing is free. */
 		vops.flags = ST20P_TX_FLAG_BLOCK_GET;
+		vops.notify_frame_done = Player::on_video_done;
 
 		v_handle_ = st20p_tx_create(dev->handle(), &vops);
 		if (!v_handle_) {
@@ -222,12 +231,25 @@ bool Player::start_sessions()
 		aops.channel = config_.channels;
 		aops.sampling = ST30_SAMPLING_48K;
 		aops.ptime = config_.ptime;
-		aops.framebuff_cnt = 4;
-		/* 10 ms per framebuffer: 10 get_frame calls per second per
-		 * buffer is cheap, and it keeps tx latency low. */
+		/* 10 ms per framebuffer. How many of them decides lip sync: with
+		 * BLOCK_GET a buffer comes back when its frame has gone out, so
+		 * what we fill now is sent `count` periods later -- 60 ms for
+		 * three video buffers at 50p. Four 10 ms audio buffers would be
+		 * 40 ms and the sound would lead by the difference, so the audio
+		 * depth is derived from the video one. Whether real hardware
+		 * agrees shows up as av_skew_ms in the status; av_offset_ms trims
+		 * what is left. */
+		const uint64_t audio_fb_ns = 10 * 1000 * 1000;
+		uint64_t video_ahead_ns = 3 /* vops.framebuff_cnt */ *
+					  mtl_fps_frame_ns(config_.fps);
+		uint16_t audio_bufs = (uint16_t)((video_ahead_ns + audio_fb_ns / 2) /
+						 audio_fb_ns);
+		aops.framebuff_cnt = config_.video_enabled
+					     ? std::clamp<uint16_t>(audio_bufs, 2, 16)
+					     : 4;
 		int fb_size = st30_calculate_framebuff_size(
 			aops.fmt, aops.ptime, aops.sampling, aops.channel,
-			10 * 1000 * 1000, nullptr);
+			audio_fb_ns, nullptr);
 		if (fb_size <= 0) {
 			VLOG_E("[play:%s] bad audio framebuff size", config_.name.c_str());
 			stop_sessions();
@@ -235,6 +257,9 @@ bool Player::start_sessions()
 		}
 		aops.framebuff_size = (uint32_t)fb_size;
 		aops.flags = ST30P_TX_FLAG_BLOCK_GET;
+		aops.notify_frame_done = Player::on_audio_done;
+		audio_block_ns_ = (uint64_t)fb_size * 1000000000ull /
+				  audio_bytes_per_second(config_.channels);
 
 		a_handle_ = st30p_tx_create(dev->handle(), &aops);
 		if (!a_handle_) {
@@ -244,7 +269,7 @@ bool Player::start_sessions()
 		}
 	}
 
-	VLOG_I("[play:%s] senders up: video %s:%u pt%u %ux%u%s %s pacing, "
+	VLOG_I("[play:%s] senders up: video %s:%u pt%u %ux%up%s %s pacing, "
 	       "audio %s:%u pt%u %uch %s",
 	       config_.name.c_str(), config_.video_dest_ip.c_str(), config_.video_port,
 	       config_.video_payload_type, config_.width, config_.height,
@@ -267,6 +292,55 @@ void Player::stop_sessions()
 	}
 }
 
+/* --- transport feedback ---------------------------------------------------- */
+
+int Player::on_video_done(void *priv, struct st_frame *frame)
+{
+	auto *p = (Player *)priv;
+	uint64_t seq = ++p->v_done_seq_;
+	if (frame->tfmt != ST10_TIMESTAMP_FMT_TAI || !frame->timestamp)
+		return 0;
+	uint64_t t = frame->timestamp;
+	if (seq == p->v_anchor_seq_.load())
+		p->v_anchor_tai_ = t;
+
+	uint64_t prev = p->v_last_done_tai_;
+	p->v_last_done_tai_ = t;
+	if (!prev || t <= prev)
+		return 0;
+	uint64_t frame_ns = mtl_fps_frame_ns(p->config_.fps);
+	uint64_t steps = (t - prev + frame_ns / 2) / frame_ns;
+	if (steps > 1 && steps < 500) {
+		p->video_slip_frames_ += (uint32_t)(steps - 1);
+		p->video_epochs_skipped_ += steps - 1;
+	}
+	return 0;
+}
+
+int Player::on_audio_done(void *priv, struct st30_frame *frame)
+{
+	auto *p = (Player *)priv;
+	uint64_t seq = ++p->a_done_seq_;
+	if (frame->tfmt != ST10_TIMESTAMP_FMT_TAI || !frame->timestamp)
+		return 0;
+	uint64_t t = frame->timestamp;
+	if (seq == p->a_anchor_seq_.load())
+		p->a_anchor_tai_ = t;
+
+	uint64_t prev = p->a_last_done_tai_;
+	p->a_last_done_tai_ = t;
+	if (!prev || t <= prev)
+		return 0;
+	/* Audio can fall behind by single packets, not only whole buffers.
+	 * Half a millisecond of deadband keeps arithmetic noise out. */
+	int64_t extra = (int64_t)(t - prev) - (int64_t)p->audio_block_ns_;
+	if (extra > 500000 && extra < 5000000000ll) {
+		p->audio_slip_ns_ += extra;
+		p->audio_gap_ns_total_ += (uint64_t)extra;
+	}
+	return 0;
+}
+
 /* --- transmit threads ------------------------------------------------------ */
 
 void Player::video_tx_loop()
@@ -276,30 +350,75 @@ void Player::video_tx_loop()
 	while (tx_running_) {
 		struct st_frame *dst = st20p_tx_get_frame(v_handle_);
 		if (!dst)
-			continue; /* woken for shutdown */
+			continue; /* woken for shutdown, or the 1 s block timeout */
+		const uint64_t woke_ns = monotonic_ns();
+		bool first_of_flow = false;
 
 		if (blank_requested_.exchange(false) && have_held_)
 			fill_black(held_frame_);
 
-		bool consumed_new = false;
-		if (state_ == State::Playing && vq_.size() > 0) {
-			VideoFrame vf;
-			if (vq_.pop(vf)) {
-				if (vf.eos) {
-					advance();
-				} else {
-					held_frame_ = std::move(vf);
-					have_held_ = true;
-					consumed_new = true;
-				}
+		const bool playing = state_ == State::Playing;
+
+		/* Preroll: hold the previous picture until the decoder has both
+		 * queues primed, then release picture and sound together. The
+		 * timeout keeps a file shorter than the preroll (or one whose
+		 * audio starts late) from holding forever. */
+		if (playing && !flowing_ && !preroll_blocked_) {
+			uint64_t now = monotonic_ns();
+			if (!preroll_started_ns_)
+				preroll_started_ns_ = now;
+			size_t want_v = std::min<size_t>(vq_.capacity() / 2, 4);
+			size_t want_a = audio_bytes_per_second(config_.channels) / 20;
+			bool v_ready = vq_.size() >= std::max<size_t>(want_v, 1);
+			bool a_ready = !item_has_audio_ || !config_.audio_enabled ||
+				       afifo_.size() >= want_a;
+			if ((v_ready && a_ready) || now - preroll_started_ns_ > 500000000ull) {
+				video_debt_ = 0;
+				video_slip_frames_ = 0;
+				v_anchor_tai_ = 0;
+				a_anchor_tai_ = 0;
+				first_of_flow = true;
+				flow_start_ns_ = woke_ns;
+				flowing_ = true;
 			}
 		}
-		if (state_ == State::Playing && !consumed_new)
-			frames_repeated_++;
+
+		bool consumed_new = false;
+		if (playing && flowing_) {
+			/* Pay back earlier underruns by skipping, but never
+			 * the last queued frame -- that one has to go out. */
+			uint32_t slipped = video_slip_frames_.exchange(0);
+			if (slipped)
+				video_debt_ = std::min<uint32_t>(video_debt_ + slipped, 250);
+			VideoFrame vf;
+			bool got = vq_.try_pop(vf);
+			while (got && !vf.eos && video_debt_ > 0 && vq_.size() > 0) {
+				VideoFrame next;
+				if (!vq_.try_pop(next))
+					break;
+				vf = std::move(next);
+				video_debt_--;
+			}
+			if (got && vf.eos) {
+				advance();
+			} else if (got) {
+				held_frame_ = std::move(vf);
+				have_held_ = true;
+				consumed_new = true;
+				shown_pts_ns_ = held_frame_.pts_ns;
+			} else {
+				frames_repeated_++;
+				if (video_debt_ < 250)
+					video_debt_++;
+			}
+		}
 
 		if (have_held_)
 			copy_to_st_frame(held_frame_, dst);
 
+		uint64_t seq = ++v_put_seq_;
+		if (first_of_flow && consumed_new)
+			v_anchor_seq_ = seq;
 		st20p_tx_put_frame(v_handle_, dst);
 		frames_sent_++;
 
@@ -317,21 +436,76 @@ void Player::video_tx_loop()
 void Player::audio_tx_loop()
 {
 	pthread_setname_np(pthread_self(), "vcard-atx");
+	const size_t sample_frame = (size_t)config_.channels * 3;
+	bool was_flowing = false;
 
 	while (tx_running_) {
 		struct st30_frame *frame = st30p_tx_get_frame(a_handle_);
 		if (!frame)
 			continue;
+		const uint64_t woke_ns = monotonic_ns();
+		const uint64_t seq = ++a_put_seq_;
 
-		bool underrun = false;
 		uint8_t *dst = (uint8_t *)frame->addr;
 		size_t len = frame->buffer_size;
-		if (state_ == State::Playing) {
-			afifo_.read_exact(dst, len, &underrun);
-			if (underrun)
-				audio_underruns_++;
+		const bool flowing = state_ == State::Playing && flowing_ &&
+				     item_has_audio_;
+		if (flowing && !was_flowing) {
+			audio_slip_ns_ = 0;
+			a_anchor_seq_ = seq;
+			/* The video thread released the item on its tick; ours
+			 * comes up to one buffer later. Skip what should have
+			 * gone out in between, so the first sample lines up with
+			 * the first picture instead of trailing it. */
+			uint64_t start = flow_start_ns_.load();
+			uint64_t lag_ns = (start && woke_ns > start) ? woke_ns - start : 0;
+			size_t lag = lag_ns < 50000000ull
+					     ? (size_t)(lag_ns * 48 / 1000000) * sample_frame
+					     : 0;
+			audio_debt_bytes_ = lag;
+			a_anchor_lag_ns_ = lag ? lag_ns : 0;
+		}
+		was_flowing = flowing;
+
+		int64_t slip_ns = audio_slip_ns_.exchange(0);
+		if (flowing && slip_ns > 0)
+			audio_debt_bytes_ += (size_t)(slip_ns * 48 / 1000000) * sample_frame;
+
+		if (flowing) {
+			size_t off = 0;
+			int64_t trim = audio_trim_bytes_.load();
+			if (trim > 0) { /* configured lead-in: audio later */
+				off = std::min<size_t>(len, (size_t)trim);
+				memset(dst, 0, off);
+				audio_trim_bytes_ -= (int64_t)off;
+			} else if (trim < 0) { /* audio earlier */
+				size_t n = afifo_.discard((size_t)-trim);
+				audio_trim_bytes_ += (int64_t)n;
+			}
+			if (audio_debt_bytes_)
+				audio_debt_bytes_ -= afifo_.discard(audio_debt_bytes_);
+
+			bool underrun = false;
+			size_t missing = 0;
+			afifo_.read_exact(dst + off, len - off, &underrun, &missing);
+			/* Running dry after the file has handed over its last
+			 * sample is simply the end of the item. */
+			if (underrun && !item_audio_done_) {
+				uint64_t n = ++audio_underruns_;
+				if (n <= 3 || n % 100 == 0)
+					VLOG_D("[play:%s] audio underrun #%llu: %zu of %zu "
+					       "bytes missing at %.2f s, video queue %zu",
+					       config_.name.c_str(), (unsigned long long)n,
+					       missing, len - off, shown_pts_ns_ / 1e9,
+					       vq_.size());
+				/* whole sample frames only, or the channels
+				 * would rotate */
+				missing -= missing % sample_frame;
+				if (audio_debt_bytes_ < audio_bytes_per_second(config_.channels))
+					audio_debt_bytes_ += missing;
+			}
 		} else {
-			memset(dst, 0, len); /* idle/paused: digital silence */
+			memset(dst, 0, len); /* idle, paused or silent file */
 		}
 		frame->data_size = len;
 
@@ -375,7 +549,7 @@ void Player::start_current_item()
 	mtl_fps_to_rational(config_.fps, &t.fps_num, &t.fps_den);
 	t.channels = config_.channels;
 
-	decoder_ = std::make_unique<FileDecoder>(vq_, afifo_, t);
+	decoder_ = std::make_unique<FileDecoder>(vq_, afifo_, t, &item_audio_done_);
 	/* Looping a single item is the decoder's job; looping a playlist is
 	 * ours (see advance()). */
 	bool single_loop = loop_ && playlist_.size() == 1;
@@ -386,6 +560,13 @@ void Player::start_current_item()
 		state_ = State::Idle;
 		return;
 	}
+	item_has_audio_ = decoder_->has_audio();
+	shown_pts_ns_ = 0;
+	/* bytes of whole sample frames; sign carries the direction */
+	int64_t trim_samples = (int64_t)config_.av_offset_ms * 48;
+	audio_trim_bytes_ = trim_samples * (int64_t)config_.channels * 3;
+	preroll_started_ns_ = 0;
+	flowing_ = false;
 	VLOG_I("[play:%s] playing [%d/%zu] %s", config_.name.c_str(),
 	       current_index_ + 1, playlist_.size(),
 	       playlist_[current_index_].path.c_str());
@@ -406,10 +587,12 @@ void Player::advance()
 	} else {
 		VLOG_I("[play:%s] playlist finished", config_.name.c_str());
 		state_ = State::Idle;
+		flowing_ = false;
 		if (decoder_)
 			decoder_->stop();
 		return;
 	}
+	flowing_ = false;
 	if (decoder_)
 		decoder_->stop();
 	start_current_item();
@@ -421,11 +604,18 @@ bool Player::play()
 	if (playlist_.empty())
 		return false;
 	if (state_ == State::Paused) {
+		/* Resume by seeking to the picture that is on screen. The two
+		 * transmit threads stop on different ticks when pausing, so
+		 * simply carrying on would leave sound and picture a little
+		 * further apart after every pause. */
+		int64_t frame_ns = (int64_t)mtl_fps_frame_ns(config_.fps);
+		seek_locked(shown_pts_ns_ + frame_ns);
 		state_ = State::Playing;
 		return true;
 	}
 	if (current_index_ < 0)
 		current_index_ = 0;
+	flowing_ = false;
 	start_current_item();
 	if (!decoder_)
 		return false;
@@ -445,6 +635,7 @@ void Player::stop()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	state_ = State::Idle;
+	flowing_ = false;
 	if (decoder_) {
 		decoder_->stop();
 		decoder_.reset();
@@ -460,6 +651,7 @@ bool Player::next()
 	if (current_index_ + 1 >= (int)playlist_.size())
 		return false;
 	current_index_++;
+	flowing_ = false;
 	if (decoder_)
 		decoder_->stop();
 	start_current_item();
@@ -473,6 +665,7 @@ bool Player::previous()
 	if (current_index_ <= 0)
 		return false;
 	current_index_--;
+	flowing_ = false;
 	if (decoder_)
 		decoder_->stop();
 	start_current_item();
@@ -483,8 +676,31 @@ bool Player::previous()
 void Player::seek(int64_t position_ns)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
-	if (decoder_)
-		decoder_->seek(position_ns);
+	seek_locked(position_ns);
+}
+
+void Player::seek_locked(int64_t position_ns)
+{
+	if (!decoder_)
+		return;
+	/* Stop taking from the queues first: what is in them belongs to the
+	 * old position, and picture and sound have to restart together. Then
+	 * empty them so a decoder blocked on a full queue gets to see the
+	 * request, and wait until it has flushed and repositioned -- otherwise
+	 * the preroll would be satisfied by leftovers. */
+	preroll_blocked_ = true;
+	flowing_ = false;
+	uint64_t before = decoder_->seek_serial();
+	decoder_->seek(position_ns);
+	for (int i = 0; i < 500 && decoder_->seek_serial() == before &&
+			!decoder_->finished(); i++) {
+		vq_.clear();
+		afifo_.clear();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	shown_pts_ns_ = position_ns;
+	preroll_started_ns_ = 0;
+	preroll_blocked_ = false;
 }
 
 Player::Status Player::status() const
@@ -498,7 +714,8 @@ Player::Status Player::status() const
 	if (current_index_ >= 0 && current_index_ < (int)playlist_.size())
 		s.current_file = playlist_[current_index_].path;
 	if (decoder_) {
-		s.position_s = decoder_->position_ns() / 1e9;
+		/* what is on the wire, not how far the decoder has run ahead */
+		s.position_s = shown_pts_ns_ / 1e9;
 		s.duration_s = decoder_->duration_ns() / 1e9;
 	}
 	s.frames_sent = frames_sent_;
@@ -510,6 +727,15 @@ Player::Status Player::status() const
 				   ? afifo_.size() * 1000 /
 					     audio_bytes_per_second(config_.channels)
 				   : 0;
+	s.video_epochs_skipped = video_epochs_skipped_;
+	s.audio_gap_ms = audio_gap_ns_total_ / 1000000;
+	uint64_t va = v_anchor_tai_, aa = a_anchor_tai_;
+	if (va && aa) {
+		s.av_skew_valid = true;
+		/* the first block starts `lag` into the item, by design */
+		s.av_skew_ms = ((double)aa - (double)a_anchor_lag_ns_.load() -
+				(double)va) / 1e6;
+	}
 	s.senders_up = tx_running_;
 	s.video_sdp_dest = config_.video_dest_ip + ":" +
 			   std::to_string(config_.video_port);

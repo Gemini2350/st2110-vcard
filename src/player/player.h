@@ -59,6 +59,11 @@ struct PlayerConfig {
 
 	/* buffering: how far the decoder may run ahead, in frames */
 	uint32_t queue_frames = 8;
+
+	/* Lip-sync trim in milliseconds, positive = audio later. The sender
+	 * already equalises the two transmit pipelines (see start_sessions);
+	 * this is for whatever a measurement on the real wire still shows. */
+	int av_offset_ms = 0;
 };
 
 struct PlaylistItem {
@@ -105,6 +110,16 @@ public:
 		uint64_t audio_underruns = 0;
 		size_t video_queue = 0, video_queue_capacity = 0;
 		size_t audio_queue_ms = 0;
+		/* Epochs the transport sent nothing in because no frame was
+		 * queued -- the transmit thread was late. Compensated for, but
+		 * each one is a visible/audible hiccup. */
+		uint64_t video_epochs_skipped = 0;
+		uint64_t audio_gap_ms = 0;
+		/* Audio minus video at the sender for the current item, from
+		 * the PTP times MTL reports for the first frame of each.
+		 * Positive = audio later. */
+		bool av_skew_valid = false;
+		double av_skew_ms = 0;
 		bool senders_up = false;
 		std::string video_sdp_dest, audio_sdp_dest;
 	};
@@ -124,6 +139,9 @@ private:
 	void audio_tx_loop();
 	void start_current_item();
 	void advance();
+	void seek_locked(int64_t position_ns);
+	static int on_video_done(void *priv, struct st_frame *frame);
+	static int on_audio_done(void *priv, struct st30_frame *frame);
 
 	PlayerConfig config_;
 	mutable std::mutex mutex_;
@@ -141,6 +159,44 @@ private:
 	std::atomic<bool> tx_running_{false};
 	std::atomic<State> state_{State::Idle};
 	std::atomic<bool> loop_{false};
+	/* --- lip sync ----------------------------------------------------
+	 * flowing_: both queues are primed and both transmit threads take from
+	 * them. Set by the video thread, so sound and picture start on the same
+	 * decision instead of each whenever its own queue first has data.
+	 * The debts are what an underrun cost: a held frame or padded silence
+	 * pushes that essence late for good unless the same amount is skipped
+	 * once the decoder has caught up. */
+	std::atomic<bool> flowing_{false};
+	std::atomic<bool> preroll_blocked_{false}; /* a seek is being carried out */
+	std::atomic<int64_t> shown_pts_ns_{0};     /* picture currently on the wire */
+	std::atomic<bool> item_has_audio_{false};
+	std::atomic<bool> item_audio_done_{false}; /* raised by the decoder */
+	uint64_t preroll_started_ns_ = 0;
+	uint32_t video_debt_ = 0;           /* video thread only */
+	size_t audio_debt_bytes_ = 0;       /* audio thread only */
+	std::atomic<int64_t> audio_trim_bytes_{0}; /* >0 lead-in silence, <0 skip */
+	std::atomic<uint64_t> flow_start_ns_{0};   /* when the video thread released */
+
+	/* --- what the transport reports back ------------------------------
+	 * MTL calls notify_frame_done with the PTP time each frame actually
+	 * went out at. Two things are read off that:
+	 *  - a gap between consecutive frames means the transport had nothing
+	 *    to send for an epoch (we were late). The content after the gap is
+	 *    late by exactly that much, so the same amount is skipped;
+	 *  - the times of the first video frame and the first audio block of
+	 *    an item give the real A/V skew at the sender.
+	 * The callbacks run on an MTL thread: atomics only, no locks. */
+	uint64_t v_last_done_tai_ = 0, a_last_done_tai_ = 0; /* callback thread */
+	std::atomic<uint32_t> video_slip_frames_{0};
+	std::atomic<int64_t> audio_slip_ns_{0};
+	std::atomic<uint64_t> video_epochs_skipped_{0};
+	std::atomic<uint64_t> audio_gap_ns_total_{0};
+	std::atomic<uint64_t> v_put_seq_{0}, v_done_seq_{0}, v_anchor_seq_{0};
+	std::atomic<uint64_t> a_put_seq_{0}, a_done_seq_{0}, a_anchor_seq_{0};
+	std::atomic<uint64_t> v_anchor_tai_{0}, a_anchor_tai_{0};
+	std::atomic<uint64_t> a_anchor_lag_ns_{0}; /* skipped at the head of that block */
+	uint64_t audio_block_ns_ = 10 * 1000 * 1000;
+
 	std::atomic<uint64_t> frames_sent_{0};
 	std::atomic<uint64_t> frames_repeated_{0};
 	std::atomic<uint64_t> audio_underruns_{0};

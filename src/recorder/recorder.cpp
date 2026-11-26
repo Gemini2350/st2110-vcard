@@ -7,8 +7,10 @@
 
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <filesystem>
 #include <pthread.h>
+#include <vector>
 
 namespace vcard {
 
@@ -266,6 +268,14 @@ void Recorder::video_rx_loop()
 		if (recording_) {
 			VideoFrame vf;
 			vf.alloc(frame->width, frame->height);
+			uint64_t ts = rx_sample_time_ns(frame->tfmt, frame->timestamp,
+							frame->receive_timestamp, 90000);
+			uint64_t origin = rec_origin_ns_.load();
+			if (ts && !origin) {
+				origin = ts;
+				rec_origin_ns_ = ts;
+			}
+			vf.pts_ns = (ts && ts >= origin) ? (int64_t)(ts - origin) : -1;
 			for (int p = 0; p < 3; p++) {
 				const uint8_t *s = planes[p];
 				uint8_t *d = vf.plane(p);
@@ -279,8 +289,14 @@ void Recorder::video_rx_loop()
 			 * is behind, and blocking here would stall MTL's
 			 * receive path and turn a disk problem into packet
 			 * loss on the network. */
-			if (!vq_.try_push(std::move(vf)))
-				frames_dropped_++;
+			if (!vq_.try_push(std::move(vf))) {
+				uint64_t n = ++frames_dropped_;
+				if (n == 1 || n % 50 == 0)
+					VLOG_W("[rec:%s] encoder is behind, %llu frame(s) "
+					       "dropped so far (frame %llu of this take)",
+					       config_.name.c_str(), (unsigned long long)n,
+					       (unsigned long long)frames_received_.load());
+			}
 		}
 
 		st20p_rx_put_frame(v_handle_, frame);
@@ -300,8 +316,80 @@ void Recorder::audio_rx_loop()
 		audio_frames_received_++;
 		meters_.feed((const uint8_t *)frame->addr, frame->data_size,
 			     config_.channels);
-		if (recording_)
-			afifo_.try_write((const uint8_t *)frame->addr, frame->data_size);
+		if (recording_) {
+			const uint8_t *data = (const uint8_t *)frame->addr;
+			size_t bytes = frame->data_size;
+			const size_t sample_bytes = (size_t)config_.channels * 3;
+			const uint64_t origin = rec_origin_ns_.load();
+			const uint64_t ts = rx_sample_time_ns(frame->tfmt, frame->timestamp,
+							      frame->receive_timestamp,
+							      48000);
+			const uint64_t dur_ns = (uint64_t)(bytes / sample_bytes) *
+						1000000000ull / 48000;
+			auto silence = [&](int64_t samples) {
+				std::vector<uint8_t> zeros(
+					(size_t)std::min<int64_t>(samples, 2 * 48000) *
+					sample_bytes);
+				return afifo_.try_write(zeros.data(), zeros.size());
+			};
+
+			if (!config_.video_enabled || !ts) {
+				/* nothing to line up against: just append */
+				afifo_.try_write(data, bytes);
+			} else if (!origin) {
+				/* no picture yet, so no zero point yet */
+			} else if (!rec_audio_placed_) {
+				int64_t lead = ((int64_t)ts - (int64_t)origin) * 48 / 1000000;
+				if (lead >= 0) {
+					/* audio starts after the first picture */
+					if (silence(lead) && afifo_.try_write(data, bytes)) {
+						rec_audio_next_ns_ = ts + dur_ns;
+						rec_audio_placed_ = true;
+					}
+				} else if ((size_t)(-lead) * sample_bytes < bytes) {
+					/* the first picture falls inside this block */
+					size_t cut = (size_t)(-lead) * sample_bytes;
+					if (afifo_.try_write(data + cut, bytes - cut)) {
+						rec_audio_next_ns_ = ts + dur_ns;
+						rec_audio_placed_ = true;
+					}
+				}
+				/* else: entirely before the first picture, skip */
+			} else {
+				int64_t gap_ns = (int64_t)ts - (int64_t)rec_audio_next_ns_;
+				if (gap_ns > 1000000) {
+					/* Hole: keep the timeline, fill with silence.
+					 * A long one (a sender that paused, a burst
+					 * of loss) can be bigger than the queue to the
+					 * encoder, so it goes in as much at a time as
+					 * there is room for. Until it is closed this
+					 * block cannot be written either -- it would
+					 * land too early -- and simply becomes part of
+					 * the hole. */
+					int64_t want = gap_ns * 48 / 1000000;
+					int64_t room = (int64_t)(afifo_.free_space() / sample_bytes);
+					int64_t n = std::min(want, room);
+					if (n > 0 && silence(n)) {
+						rec_audio_next_ns_ += (uint64_t)n * 1000000000ull / 48000;
+						audio_gap_ms_ += (uint64_t)(n / 48);
+					}
+					gap_ns = (int64_t)ts - (int64_t)rec_audio_next_ns_;
+				}
+				if (gap_ns <= 1000000) {
+					size_t cut = 0;
+					if (gap_ns < -1000000)
+						/* overlap (duplicate or re-sent data):
+						 * drop the part we already have */
+						cut = std::min(bytes,
+							       (size_t)(-gap_ns * 48 / 1000000) *
+								       sample_bytes);
+					/* advance only on success: a block the encoder
+					 * had no room for becomes a hole next round */
+					if (afifo_.try_write(data + cut, bytes - cut))
+						rec_audio_next_ns_ = ts + dur_ns;
+				}
+			}
+		}
 
 		st30p_rx_put_frame(a_handle_, frame);
 	}
@@ -341,11 +429,16 @@ bool Recorder::start_recording(const std::string &filename)
 
 	vq_.restart();
 	afifo_.restart();
+	rec_origin_ns_ = 0;
+	rec_audio_placed_ = false;
+	audio_gap_ms_ = 0;
 	encoder_ = std::make_unique<FileEncoder>(vq_, afifo_, t);
 	if (!encoder_->start(recording_path_)) {
+		last_record_error_ = encoder_->last_error();
 		encoder_.reset();
 		return false;
 	}
+	last_record_error_.clear();
 	frames_dropped_ = 0;
 	recording_ = true;
 	VLOG_I("[rec:%s] recording started: %s", config_.name.c_str(),
@@ -379,6 +472,7 @@ Recorder::Status Recorder::status() const
 	s.frames_incomplete = frames_incomplete_;
 	s.frames_dropped = frames_dropped_;
 	s.audio_frames_received = audio_frames_received_;
+	s.audio_gap_ms = audio_gap_ms_;
 
 	uint64_t last = last_frame_ns_.load();
 	if (last) {
@@ -403,8 +497,8 @@ Recorder::Status Recorder::status() const
 		s.recorded_frames = encoder_->frames_written();
 		s.recorded_mib = encoder_->bytes_written() / 1048576.0;
 		s.recorded_seconds = s.fps > 0 ? s.recorded_frames / s.fps : 0;
-		s.last_error = encoder_->last_error();
 	}
+	s.last_error = last_record_error_;
 	s.video_source = config_.video_multicast_ip + ":" +
 			 std::to_string(config_.video_port);
 	s.audio_source = config_.audio_multicast_ip + ":" +

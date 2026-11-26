@@ -83,6 +83,7 @@ public:
 		uint64_t frames_incomplete = 0; /* packet loss on the wire */
 		uint64_t frames_dropped = 0;    /* encoder could not keep up */
 		uint64_t audio_frames_received = 0;
+		uint64_t audio_gap_ms = 0; /* holes in the audio of this take */
 		int64_t last_frame_age_ms = -1;
 		bool recording = false;
 		std::string recording_path;
@@ -119,6 +120,7 @@ private:
 	AudioFifo afifo_;
 	std::unique_ptr<FileEncoder> encoder_;
 	std::string recording_path_;
+	std::string last_record_error_; /* why the last start_recording failed */
 
 	std::thread v_thread_, a_thread_;
 	std::atomic<bool> rx_running_{false};
@@ -133,6 +135,19 @@ private:
 	std::atomic<uint64_t> frames_dropped_{0};
 	std::atomic<uint64_t> audio_frames_received_{0};
 	std::atomic<uint64_t> last_frame_ns_{0};
+
+	/* Sampling time (TAI ns) of the first recorded video frame: the zero
+	 * point of the file. Audio is cut or padded to start exactly there, so
+	 * lip sync in the recording is the sender's, not a by-product of how
+	 * long each essence took to get through the receive path. */
+	std::atomic<uint64_t> rec_origin_ns_{0};
+	std::atomic<bool> rec_audio_placed_{false};
+	/* Sampling time the next audio sample is expected at (audio thread).
+	 * A block that arrives later than that leaves a hole -- lost packets,
+	 * a sender that paused -- and the hole is written as silence so that
+	 * everything after it stays where it belongs. */
+	uint64_t rec_audio_next_ns_ = 0;
+	std::atomic<uint64_t> audio_gap_ms_{0};
 
 	Preview preview_;
 	AudioMeters meters_;

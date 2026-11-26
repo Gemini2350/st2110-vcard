@@ -13,6 +13,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <algorithm>
 #include <pthread.h>
 #include <vector>
 
@@ -72,8 +73,8 @@ AVCodecContext *open_stream(AVFormatContext *fmt, int index)
 } // namespace
 
 FileDecoder::FileDecoder(BoundedQueue<VideoFrame> &vq, AudioFifo &afifo,
-			 DecoderTarget target)
-	: vq_(vq), afifo_(afifo), target_(target)
+			 DecoderTarget target, std::atomic<bool> *audio_done)
+	: vq_(vq), afifo_(afifo), target_(target), audio_done_(audio_done)
 {
 }
 
@@ -136,6 +137,11 @@ bool FileDecoder::start(const std::string &path, bool loop)
 	finished_ = false;
 	position_ns_ = 0;
 	frames_emitted_ = 0;
+	has_audio_ = info.audio_channels > 0;
+	loop_audio_excess_ = 0;
+	seek_request_ = -1;
+	if (audio_done_)
+		*audio_done_ = false;
 	thread_ = std::thread(&FileDecoder::run, this, path, loop);
 	return true;
 }
@@ -164,6 +170,8 @@ void FileDecoder::run(std::string path, bool loop)
 	} while (loop && running_);
 
 	finished_ = true;
+	if (audio_done_)
+		*audio_done_ = true;
 	/* Sentinel so the player knows the item ended rather than stalled. */
 	VideoFrame eos;
 	eos.eos = true;
@@ -204,35 +212,84 @@ bool FileDecoder::decode_file(const std::string &path)
 			VLOG_W("[dec] audio stream present but not decodable; "
 			       "playing silence");
 	}
+	has_audio_ = adec.p != nullptr;
 
-	/* --- scalers -------------------------------------------------------
-	 * If the file already is yuv422p10le at the session size, swscale is a
-	 * plain copy; we still route through it so there is exactly one path. */
 	SwsContext *sws = nullptr;
 	SwrContext *swr = nullptr;
+	struct Cleanup {
+		SwsContext *&sws;
+		SwrContext *&swr;
+		~Cleanup()
+		{
+			if (sws) sws_freeContext(sws);
+			if (swr) swr_free(&swr);
+		}
+	} cleanup{sws, swr};
 
 	std::vector<uint8_t> l24;
 	std::vector<int32_t> s32;
+	const size_t bytes_per_frame = (size_t)target_.channels * 3;
+	const AVRational ns_base{1, 1000000000};
 
+	/* --- timeline ------------------------------------------------------
+	 * Everything below runs on one timeline that starts at zero at the
+	 * beginning of the file. A container's own timestamps do not: camera
+	 * files and transport streams routinely start at an hour or at some
+	 * arbitrary PCR value, and audio and video rarely start on the same
+	 * tick. The container's start_time is the origin both essences are
+	 * measured from, which keeps their offset to each other intact. */
+	int64_t origin_ns = fmt.p->start_time != AV_NOPTS_VALUE
+				    ? fmt.p->start_time * 1000ll
+				    : AV_NOPTS_VALUE;
+
+	/* Session grid: one slot per transmitted frame. */
 	const int64_t frame_ns =
 		(int64_t)1000000000ll * target_.fps_den / target_.fps_num;
-	int64_t out_index = 0;   /* next frame slot on the session grid */
+	/* How long one picture of *this file* is on screen. Decides how many
+	 * session slots it fills: two for 25p on 50p, sometimes none for 60p
+	 * on 50p. */
+	AVRational src_rate = av_guess_frame_rate(fmt.p, fmt.p->streams[vidx], nullptr);
+	const int64_t src_frame_ns = (src_rate.num > 0 && src_rate.den > 0)
+					     ? (int64_t)1000000000ll * src_rate.den / src_rate.num
+					     : frame_ns;
+
+	int64_t out_index = 0;   /* next slot on the session grid */
 	VideoFrame pending;      /* most recent decoded picture */
 	bool have_pending = false;
+
+	/* Audio is placed on the same timeline once, at the start and after
+	 * every seek, and then simply appended: gate_ns is the timeline
+	 * position the next written sample has to land on. */
+	int64_t gate_ns = 0;
+	bool audio_placed = false;
+	int64_t audio_drop = loop_audio_excess_; /* samples to discard first */
+	int64_t audio_written = 0;               /* samples since gate_ns */
+	loop_audio_excess_ = 0;
+
+	auto write_silence = [&](int64_t samples) {
+		static const uint8_t zeros[4800 * 3] = {0};
+		size_t bytes = (size_t)samples * bytes_per_frame;
+		while (bytes) {
+			size_t n = std::min(bytes, sizeof(zeros) - sizeof(zeros) % bytes_per_frame);
+			if (!afifo_.write(zeros, n))
+				return false;
+			bytes -= n;
+		}
+		audio_written += samples;
+		return true;
+	};
 
 	Packet pkt;
 	Frame frame;
 	bool eof = false;
 
-	auto emit_until = [&](int64_t decoded_pts_ns) {
-		/* Fill every session slot whose timestamp is covered by the
-		 * picture we are holding. Repeats on upconversion (25->50),
-		 * skips slots on downconversion (60->50). The last slot moves
-		 * the buffer instead of copying it, so the 1:1 case -- which is
-		 * what a correctly authored file does -- costs no memcpy at all.
+	auto emit_until = [&](int64_t covered_until_ns) {
+		/* Fill every session slot the held picture covers. The last
+		 * slot moves the buffer instead of copying it, so the 1:1 case
+		 * -- a file authored at the session rate -- costs no memcpy.
 		 * At UHD that copy would be 12 MB per frame. */
-		while (have_pending && out_index * frame_ns < decoded_pts_ns) {
-			bool last = (out_index + 1) * frame_ns >= decoded_pts_ns;
+		while (have_pending && out_index * frame_ns < covered_until_ns) {
+			bool last = (out_index + 1) * frame_ns >= covered_until_ns;
 			VideoFrame out = last ? std::move(pending) : pending;
 			out.pts_ns = out_index * frame_ns;
 			position_ns_ = out.pts_ns;
@@ -249,18 +306,32 @@ bool FileDecoder::decode_file(const std::string &path)
 	while (running_) {
 		int64_t seek_to = seek_request_.exchange(-1);
 		if (seek_to >= 0) {
-			int64_t ts = av_rescale_q(seek_to, AVRational{1, 1000000000},
-						  AV_TIME_BASE_Q);
+			int64_t abs_ns = seek_to + (origin_ns == AV_NOPTS_VALUE ? 0 : origin_ns);
+			int64_t ts = av_rescale_q(abs_ns, ns_base, AV_TIME_BASE_Q);
 			if (av_seek_frame(fmt.p, -1, ts, AVSEEK_FLAG_BACKWARD) >= 0) {
 				avcodec_flush_buffers(vdec.p);
 				if (adec.p)
 					avcodec_flush_buffers(adec.p);
+				if (swr)
+					swr_free(&swr); /* drops its buffered tail */
+				/* Both queues, or the old audio keeps playing
+				 * under the new picture. */
 				vq_.clear();
+				afifo_.clear();
 				out_index = seek_to / frame_ns;
 				have_pending = false;
+				gate_ns = out_index * frame_ns;
+				audio_placed = false;
+				audio_drop = 0;
+				audio_written = 0;
+				position_ns_ = gate_ns;
+				eof = false;
 			}
+			seek_serial_++; /* also on failure: nobody should wait on it */
 		}
 
+		AVCodecContext *dec = nullptr;
+		bool is_video = false;
 		if (!eof) {
 			err = av_read_frame(fmt.p, pkt.p);
 			if (err == AVERROR_EOF) {
@@ -271,34 +342,40 @@ bool FileDecoder::decode_file(const std::string &path)
 			} else if (err < 0) {
 				VLOG_E("[dec] read error: %s", av_err(err).c_str());
 				break;
+			} else {
+				if (pkt.p->stream_index == vidx) {
+					dec = vdec.p;
+					is_video = true;
+				} else if (aidx >= 0 && pkt.p->stream_index == aidx) {
+					dec = adec.p;
+				}
+				if (dec)
+					avcodec_send_packet(dec, pkt.p);
+				av_packet_unref(pkt.p);
+				if (!dec)
+					continue;
 			}
-		}
-
-		AVCodecContext *dec = nullptr;
-		bool is_video = false;
-		if (!eof) {
-			if (pkt.p->stream_index == vidx) {
-				dec = vdec.p;
-				is_video = true;
-			} else if (aidx >= 0 && pkt.p->stream_index == aidx) {
-				dec = adec.p;
-			}
-			if (dec)
-				avcodec_send_packet(dec, pkt.p);
-			av_packet_unref(pkt.p);
-			if (!dec)
-				continue;
 		}
 
 		/* On EOF drain both decoders; otherwise only the one we fed. */
 		for (int pass = 0; pass < 2; pass++) {
-			AVCodecContext *d = eof ? (pass == 0 ? vdec.p : adec.p)
-						: dec;
+			AVCodecContext *d = eof ? (pass == 0 ? vdec.p : adec.p) : dec;
 			bool video = eof ? (pass == 0) : is_video;
-			if (!d)
+			if (!d) {
+				if (!eof)
+					break;
 				continue;
+			}
 
 			while (avcodec_receive_frame(d, frame.p) == 0) {
+				int64_t pts = frame.p->best_effort_timestamp;
+				AVRational tb = fmt.p->streams[video ? vidx : aidx]->time_base;
+				int64_t pts_ns = pts == AV_NOPTS_VALUE
+							 ? AV_NOPTS_VALUE
+							 : av_rescale_q(pts, tb, ns_base);
+				if (origin_ns == AV_NOPTS_VALUE && pts_ns != AV_NOPTS_VALUE)
+					origin_ns = pts_ns;
+
 				if (video) {
 					sws = sws_getCachedContext(
 						sws, frame.p->width, frame.p->height,
@@ -312,6 +389,16 @@ bool FileDecoder::decode_file(const std::string &path)
 						       frame.p->format);
 						return false;
 					}
+					int64_t rel = pts_ns == AV_NOPTS_VALUE
+							      ? out_index * frame_ns
+							      : pts_ns - origin_ns;
+					/* Pictures entirely before the next slot
+					 * (the run-up after a seek) need no
+					 * conversion at all. */
+					if (rel + src_frame_ns <= out_index * frame_ns) {
+						av_frame_unref(frame.p);
+						continue;
+					}
 					VideoFrame vf;
 					vf.alloc(target_.width, target_.height);
 					uint8_t *dst[3] = {vf.plane(0), vf.plane(1),
@@ -321,20 +408,11 @@ bool FileDecoder::decode_file(const std::string &path)
 							     (int)vf.stride[2]};
 					sws_scale(sws, frame.p->data, frame.p->linesize, 0,
 						  frame.p->height, dst, dst_stride);
-
-					int64_t pts = frame.p->best_effort_timestamp;
-					int64_t pts_ns =
-						pts == AV_NOPTS_VALUE
-							? out_index * frame_ns
-							: av_rescale_q(
-								  pts,
-								  fmt.p->streams[vidx]->time_base,
-								  AVRational{1, 1000000000});
 					pending = std::move(vf);
 					have_pending = true;
-					if (!emit_until(pts_ns + frame_ns))
+					if (!emit_until(rel + src_frame_ns))
 						return false;
-				} else if (adec.p) {
+				} else {
 					if (!swr) {
 						AVChannelLayout out_layout;
 						av_channel_layout_default(
@@ -343,7 +421,7 @@ bool FileDecoder::decode_file(const std::string &path)
 							    &swr, &out_layout,
 							    AV_SAMPLE_FMT_S32,
 							    target_.sample_rate,
-							    &d->ch_layout,
+							    &frame.p->ch_layout,
 							    (AVSampleFormat)frame.p->format,
 							    frame.p->sample_rate, 0,
 							    nullptr) < 0 ||
@@ -352,20 +430,47 @@ bool FileDecoder::decode_file(const std::string &path)
 							return false;
 						}
 					}
+					if (!audio_placed && pts_ns != AV_NOPTS_VALUE) {
+						/* Where does this block sit relative
+						 * to where audio has to start? Late:
+						 * pad with silence. Early (always the
+						 * case after a seek, which lands on a
+						 * keyframe before the target): cut. */
+						int64_t lead_ns = (pts_ns - origin_ns) - gate_ns;
+						int64_t lead = av_rescale(lead_ns,
+									  target_.sample_rate,
+									  1000000000);
+						if (lead > 0) {
+							/* cap: a broken timestamp must
+							 * not buy minutes of silence */
+							if (!write_silence(std::min<int64_t>(
+								    lead, target_.sample_rate * 10)))
+								return false;
+						} else {
+							audio_drop += -lead;
+						}
+						audio_placed = true;
+					}
 					int max_out = swr_get_out_samples(
 						swr, frame.p->nb_samples);
 					s32.resize((size_t)max_out * target_.channels);
 					uint8_t *out = (uint8_t *)s32.data();
 					int got = swr_convert(swr, &out, max_out,
-							      (const uint8_t **)frame.p->data,
+							      (const uint8_t **)frame.p->extended_data,
 							      frame.p->nb_samples);
-					if (got > 0) {
-						size_t total =
-							(size_t)got * target_.channels;
+					int skip = (int)std::min<int64_t>(audio_drop,
+									  got > 0 ? got : 0);
+					audio_drop -= skip;
+					if (got - skip > 0) {
+						size_t total = (size_t)(got - skip) *
+							       target_.channels;
 						l24.resize(total * 3);
-						s32_to_l24be(s32.data(), l24.data(), total);
+						s32_to_l24be(s32.data() +
+								     (size_t)skip * target_.channels,
+							     l24.data(), total);
 						if (!afifo_.write(l24.data(), l24.size()))
 							return false;
+						audio_written += got - skip;
 					}
 				}
 				av_frame_unref(frame.p);
@@ -376,19 +481,54 @@ bool FileDecoder::decode_file(const std::string &path)
 				break;
 		}
 
-		if (eof)
+		if (eof) {
+			/* A seek that arrives while we sit at the end is still
+			 * a seek. */
+			if (seek_request_.load() >= 0)
+				continue;
 			break;
+		}
 	}
+	if (!running_)
+		return false;
 
-	/* Flush the last held picture onto the grid so a file never ends one
-	 * frame short. */
+	/* The last picture stays up for its full duration. */
 	if (have_pending)
 		emit_until((out_index + 1) * frame_ns);
 
-	if (sws)
-		sws_freeContext(sws);
-	if (swr)
-		swr_free(&swr);
+	/* The resampler holds back a few samples for its filter; get them out. */
+	if (swr && has_audio_) {
+		int tail = swr_get_out_samples(swr, 0);
+		if (tail > 0) {
+			s32.resize((size_t)tail * target_.channels);
+			uint8_t *out = (uint8_t *)s32.data();
+			int got = swr_convert(swr, &out, tail, nullptr, 0);
+			int skip = (int)std::min<int64_t>(audio_drop, got > 0 ? got : 0);
+			if (got - skip > 0) {
+				size_t total = (size_t)(got - skip) * target_.channels;
+				l24.resize(total * 3);
+				s32_to_l24be(s32.data() + (size_t)skip * target_.channels,
+					     l24.data(), total);
+				if (!afifo_.write(l24.data(), l24.size()))
+					return false;
+				audio_written += got - skip;
+			}
+		}
+	}
+
+	/* Make the audio exactly as long as the video that went out. Files are
+	 * rarely cut that precisely; left alone, every pass of a loop would
+	 * shift sound against picture by the difference. */
+	if (has_audio_) {
+		int64_t video_ns = out_index * frame_ns - gate_ns;
+		int64_t want = av_rescale(video_ns, target_.sample_rate, 1000000000);
+		if (audio_written < want) {
+			if (!write_silence(want - audio_written))
+				return false;
+		} else {
+			loop_audio_excess_ = audio_written - want;
+		}
+	}
 	return running_;
 }
 

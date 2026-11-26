@@ -53,6 +53,9 @@ json player_json(Player *p)
 	j["video_queue"] = s.video_queue;
 	j["video_queue_capacity"] = s.video_queue_capacity;
 	j["audio_queue_ms"] = s.audio_queue_ms;
+	j["video_epochs_skipped"] = s.video_epochs_skipped;
+	j["audio_gap_ms"] = s.audio_gap_ms;
+	j["av_skew_ms"] = s.av_skew_valid ? json(s.av_skew_ms) : json(nullptr);
 	j["senders_up"] = s.senders_up;
 	j["video_dest"] = s.video_sdp_dest;
 	j["audio_dest"] = s.audio_sdp_dest;
@@ -85,6 +88,7 @@ json recorder_json(Recorder *r)
 	j["frames_incomplete"] = s.frames_incomplete;
 	j["frames_dropped"] = s.frames_dropped;
 	j["audio_frames_received"] = s.audio_frames_received;
+	j["audio_gap_ms"] = s.audio_gap_ms;
 	j["last_frame_age_ms"] = s.last_frame_age_ms;
 	j["recording"] = s.recording;
 	j["recording_path"] = s.recording_path;
@@ -185,6 +189,19 @@ HttpServer::~HttpServer() { stop(); }
 bool HttpServer::start()
 {
 	install_routes();
+
+	/* A request with neither Content-Length nor chunked encoding has no
+	 * body (RFC 9112 6.3). cpp-httplib instead reads until the connection
+	 * closes, so a bare `curl -X POST .../stop` sits in the read timeout
+	 * for seconds before its handler runs. State the length for it. */
+	server_->set_pre_routing_handler(
+		[](const httplib::Request &req, httplib::Response &) {
+			if (!req.has_header("Content-Length") &&
+			    !req.has_header("Transfer-Encoding"))
+				const_cast<httplib::Request &>(req).set_header(
+					"Content-Length", "0");
+			return httplib::Server::HandlerResponse::Unhandled;
+		});
 
 	if (!server_->set_mount_point("/", config_.web_root))
 		VLOG_W("[http] web root '%s' not found -- API still available",
@@ -393,10 +410,15 @@ void HttpServer::install_routes()
 				 send_error(res, 400, "filename must not contain '/'");
 				 return;
 			 }
+			 if (r->recording()) {
+				 send_error(res, 409, "already recording");
+				 return;
+			 }
 			 if (!r->start_recording(filename)) {
-				 send_error(res, 409,
-					    "cannot start recording (already running "
-					    "or receivers down)");
+				 std::string why = r->status().last_error;
+				 send_error(res, 500,
+					    "cannot start recording: " +
+						    (why.empty() ? "receivers are down" : why));
 				 return;
 			 }
 			 send_json(res, recorder_json(r));

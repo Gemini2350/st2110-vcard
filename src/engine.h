@@ -7,7 +7,9 @@
 
 #include "config.h"
 
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -64,6 +66,14 @@ public:
 
 private:
 	void register_nmos();
+
+	struct ProbeEntry {
+		uint64_t size = 0;
+		int64_t mtime = 0;
+		MediaFile file;
+	};
+	mutable std::mutex probe_mutex_;
+	mutable std::map<std::string, ProbeEntry> probe_cache_;
 
 	Config config_;
 	std::vector<std::unique_ptr<Player>> players_;

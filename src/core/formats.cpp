@@ -165,6 +165,24 @@ uint64_t monotonic_ns()
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+uint64_t rx_sample_time_ns(enum st10_timestamp_fmt tfmt, uint64_t timestamp,
+			   uint64_t receive_timestamp, uint32_t clock_rate)
+{
+	if (tfmt == ST10_TIMESTAMP_FMT_TAI)
+		return timestamp ? timestamp : receive_timestamp;
+	if (tfmt != ST10_TIMESTAMP_FMT_MEDIA_CLK || !receive_timestamp || !clock_rate)
+		return receive_timestamp;
+
+	/* RTP timestamp the arrival instant corresponds to, then the signed
+	 * distance from there to the stamped one (a sender stamps a little in
+	 * the past; the int32 cast folds the 32-bit wrap away). */
+	__uint128_t ticks = (__uint128_t)receive_timestamp * clock_rate / 1000000000ull;
+	uint32_t at_arrival = (uint32_t)ticks;
+	int32_t delta = (int32_t)((uint32_t)timestamp - at_arrival);
+	int64_t delta_ns = (int64_t)delta * 1000000000ll / (int64_t)clock_rate;
+	return (uint64_t)((int64_t)receive_timestamp + delta_ns);
+}
+
 uint64_t rx_timestamp_to_monotonic(enum st10_timestamp_fmt tfmt, uint64_t timestamp,
 				   uint64_t receive_timestamp)
 {

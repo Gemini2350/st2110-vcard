@@ -111,7 +111,12 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 	}
 
 	p.log_level = (enum mtl_log_level)params.log_level;
-	p.flags = MTL_FLAG_BIND_NUMA;
+	/* DEV_AUTO_START_STOP is not optional here. Without it MTL creates the
+	 * sessions and then moves no packet until someone calls mtl_start() --
+	 * the senders stay silent and BLOCK_GET just times out once a second.
+	 * Sessions come and go at runtime in this daemon, so let the device run
+	 * for as long as the handle lives. */
+	p.flags = MTL_FLAG_BIND_NUMA | MTL_FLAG_DEV_AUTO_START_STOP;
 
 	/* Two ways to get PTP time, and they are mutually exclusive:
 	 *

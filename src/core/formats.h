@@ -55,4 +55,16 @@ uint64_t rx_timestamp_to_monotonic(enum st10_timestamp_fmt tfmt, uint64_t timest
 
 uint64_t monotonic_ns();
 
+/* Sampling instant of an RX frame in TAI nanoseconds.
+ *
+ * MTL hands RX frames over with the 32-bit RTP timestamp (media clock: 90 kHz
+ * for video, the sample rate for audio) plus the PTP time at which the first
+ * packet arrived. The RTP value alone wraps every few hours and at a different
+ * period for each essence, so it is anchored here to the arrival time: the
+ * result is the point on the PTP timeline the sender stamped, which is the one
+ * thing video and audio of a ST 2110 source genuinely share. Returns 0 when
+ * the frame carries nothing usable. */
+uint64_t rx_sample_time_ns(enum st10_timestamp_fmt tfmt, uint64_t timestamp,
+			   uint64_t receive_timestamp, uint32_t clock_rate);
+
 } // namespace vcard

@@ -76,6 +76,7 @@ function playerCard(p) {
           <dt>Datei</dt><dd data-file></dd>
           <dt>Puffer</dt><dd data-buffer></dd>
           <dt>Frames</dt><dd data-frames></dd>
+          <dt>Sync</dt><dd data-sync></dd>
         </dl>
         <progress data-progress max="100" value="0"></progress>
         <div data-times class="kv" style="grid-template-columns:auto auto;justify-content:space-between"></div>
@@ -121,6 +122,10 @@ function updatePlayer(el, p) {
     `${p.video_queue}/${p.video_queue_capacity} Frames · ${p.audio_queue_ms} ms Audio`;
   el.querySelector('[data-frames]').textContent =
     `${p.frames_sent} gesendet, ${p.frames_repeated} wiederholt, ${p.audio_underruns} Audio-Underruns`;
+
+  el.querySelector('[data-sync]').textContent =
+    (p.av_skew_ms === null ? 'A/V-Versatz —' : `A/V-Versatz ${p.av_skew_ms.toFixed(1)} ms`) +
+    ` · ${p.video_epochs_skipped} Epochen ausgelassen · ${p.audio_gap_ms} ms Audiolücke`;
 
   const prog = el.querySelector('[data-progress]');
   prog.value = p.duration_s ? (p.position_s / p.duration_s) * 100 : 0;
@@ -192,7 +197,8 @@ function updateRecorder(el, r) {
   el.querySelector('[data-vsrc]').textContent = r.video_source;
   el.querySelector('[data-asrc]').textContent = r.audio_source;
   el.querySelector('[data-received]').textContent =
-    `${r.frames_received} Frames, ${r.frames_incomplete} unvollständig, ${r.frames_dropped} verworfen`;
+    `${r.frames_received} Frames, ${r.frames_incomplete} unvollständig, ${r.frames_dropped} verworfen` +
+    (r.audio_gap_ms ? `, ${r.audio_gap_ms} ms Audiolücke` : '');
   el.querySelector('[data-codec]').textContent = r.codec;
   el.querySelector('[data-recinfo]').textContent = r.recording
     ? `${r.recording_path.split('/').pop()} · ${fmtTime(r.recorded_seconds)} · ${r.recorded_mib.toFixed(0)} MiB`

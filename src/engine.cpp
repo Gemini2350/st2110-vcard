@@ -143,6 +143,22 @@ void Engine::register_nmos()
 	nc.registry_port = config_.nmos.registry_port;
 	nc.http_port = config_.nmos.http_port;
 
+	/* An activation only retargets a session when it carries a complete
+	 * destination. Deactivations (master_enable false) and unicast setups
+	 * arrive with the address empty or null; restarting a session onto
+	 * that would just kill it. The payload type is deliberately left as
+	 * configured: it travels in the SDP, which the node does not hand us,
+	 * and overwriting it with a default silently breaks any stream that
+	 * is not on 96. */
+	auto usable = [](const vcard_nmos::TransportParams &np, const char *what) {
+		if (np.dest_ip.empty() || !np.dest_port) {
+			VLOG_W("[nmos] %s activation without destination ignored "
+			       "(deactivate / unicast are not handled yet)", what);
+			return false;
+		}
+		return true;
+	};
+
 	auto *node = vcard_nmos::NmosNode::start(nc);
 	if (!node) {
 		VLOG_W("[engine] NMOS node did not start; continuing without it");
@@ -175,10 +191,11 @@ void Engine::register_nmos()
 			node->add_sender(vcard_nmos::EssenceKind::VideoRaw,
 					 c.name + " video", vf, af, tp,
 					 [pp](const vcard_nmos::TransportParams &np) {
+						 if (!usable(np, "video sender"))
+							 return;
 						 PlayerConfig nc2 = pp->config();
 						 nc2.video_dest_ip = np.dest_ip;
 						 nc2.video_port = np.dest_port;
-						 nc2.video_payload_type = np.payload_type;
 						 pp->reconfigure(nc2);
 					 });
 		}
@@ -192,10 +209,11 @@ void Engine::register_nmos()
 			node->add_sender(vcard_nmos::EssenceKind::AudioL24,
 					 c.name + " audio", vf, af, tp,
 					 [pp](const vcard_nmos::TransportParams &np) {
+						 if (!usable(np, "audio sender"))
+							 return;
 						 PlayerConfig nc2 = pp->config();
 						 nc2.audio_dest_ip = np.dest_ip;
 						 nc2.audio_port = np.dest_port;
-						 nc2.audio_payload_type = np.payload_type;
 						 pp->reconfigure(nc2);
 					 });
 		}
@@ -219,22 +237,24 @@ void Engine::register_nmos()
 			node->add_receiver(vcard_nmos::EssenceKind::VideoRaw,
 					   c.name + " video", vf, af,
 					   [rr](const vcard_nmos::TransportParams &np) {
+						   if (!usable(np, "video receiver"))
+							   return;
 						   RecorderConfig nc2 = rr->config();
 						   nc2.video_multicast_ip = np.dest_ip;
 						   nc2.video_port = np.dest_port;
 						   nc2.video_source_ip = np.source_ip;
-						   nc2.video_payload_type = np.payload_type;
 						   rr->reconfigure(nc2);
 					   });
 		if (c.audio_enabled)
 			node->add_receiver(vcard_nmos::EssenceKind::AudioL24,
 					   c.name + " audio", vf, af,
 					   [rr](const vcard_nmos::TransportParams &np) {
+						   if (!usable(np, "audio receiver"))
+							   return;
 						   RecorderConfig nc2 = rr->config();
 						   nc2.audio_multicast_ip = np.dest_ip;
 						   nc2.audio_port = np.dest_port;
 						   nc2.audio_source_ip = np.source_ip;
-						   nc2.audio_payload_type = np.payload_type;
 						   rr->reconfigure(nc2);
 					   });
 	}
@@ -276,13 +296,31 @@ std::vector<Recorder *> Engine::recorders()
 
 std::vector<MediaFile> Engine::media_files() const
 {
+	/* The GUI asks for this list every few seconds. Probing opens every
+	 * file and reads into it, so results are kept until size or mtime of
+	 * the file change. */
+	std::lock_guard<std::mutex> lock(probe_mutex_);
 	std::vector<MediaFile> out;
+	std::map<std::string, ProbeEntry> fresh;
 	std::error_code ec;
 	for (const auto &e : fs::directory_iterator(config_.media_dir, ec)) {
 		if (!e.is_regular_file(ec) || !has_media_extension(e.path()))
 			continue;
-		out.push_back(describe(e.path()));
+		const std::string key = e.path().string();
+		uint64_t size = fs::file_size(e.path(), ec);
+		int64_t mtime = (int64_t)fs::last_write_time(e.path(), ec)
+					.time_since_epoch()
+					.count();
+		auto it = probe_cache_.find(key);
+		if (it != probe_cache_.end() && it->second.size == size &&
+		    it->second.mtime == mtime) {
+			fresh.emplace(key, it->second);
+		} else {
+			fresh.emplace(key, ProbeEntry{size, mtime, describe(e.path())});
+		}
+		out.push_back(fresh[key].file);
 	}
+	probe_cache_.swap(fresh);
 	std::sort(out.begin(), out.end(),
 		  [](const MediaFile &a, const MediaFile &b) { return a.name < b.name; });
 	return out;

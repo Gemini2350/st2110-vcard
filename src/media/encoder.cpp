@@ -12,6 +12,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <algorithm>
+#include <future>
 #include <pthread.h>
 #include <vector>
 
@@ -29,22 +31,24 @@ std::string av_err(int err)
 struct CodecPlan {
 	const char *encoder;
 	AVPixelFormat pix_fmt;
-	const char *container;
+	const char *format;    /* libavformat muxer name */
+	const char *extension; /* what the file is called; not always the same */
 };
 
 CodecPlan plan_for(RecordCodec c)
 {
 	switch (c) {
 	case RecordCodec::ProRes4444:
-		return {"prores_ks", AV_PIX_FMT_YUV444P10LE, "mov"};
+		return {"prores_ks", AV_PIX_FMT_YUV444P10LE, "mov", "mov"};
 	case RecordCodec::FFV1:
-		return {"ffv1", AV_PIX_FMT_YUV422P10LE, "mkv"};
+		return {"ffv1", AV_PIX_FMT_YUV422P10LE, "matroska", "mkv"};
 	case RecordCodec::V210:
-		return {"v210", AV_PIX_FMT_YUV422P10LE, "mov"};
+		return {"v210", AV_PIX_FMT_YUV422P10LE, "mov", "mov"};
 	case RecordCodec::H264:
-		return {"libx264", AV_PIX_FMT_YUV420P, "mp4"};
+		/* mov, not mp4: the audio is PCM, which mp4 only learned recently */
+		return {"libx264", AV_PIX_FMT_YUV420P, "mov", "mov"};
 	default:
-		return {"prores_ks", AV_PIX_FMT_YUV422P10LE, "mov"};
+		return {"prores_ks", AV_PIX_FMT_YUV422P10LE, "mov", "mov"};
 	}
 }
 
@@ -70,7 +74,7 @@ const char *record_codec_name(RecordCodec c)
 	}
 }
 
-const char *record_codec_extension(RecordCodec c) { return plan_for(c).container; }
+const char *record_codec_extension(RecordCodec c) { return plan_for(c).extension; }
 
 FileEncoder::FileEncoder(BoundedQueue<VideoFrame> &vq, AudioFifo &afifo,
 			 EncoderTarget target)
@@ -88,7 +92,21 @@ bool FileEncoder::start(const std::string &path)
 	frames_written_ = 0;
 	bytes_written_ = 0;
 	running_ = true;
+	opened_ = std::promise<bool>();
+	auto opened = opened_.get_future();
 	thread_ = std::thread(&FileEncoder::run, this);
+
+	/* Wait until the file is really open. Everything that can go wrong
+	 * with a recording goes wrong here -- encoder missing from this ffmpeg
+	 * build, directory not writable, disk full -- and "the REC light is on
+	 * but nothing is being written" is the one failure a recorder must not
+	 * have. */
+	if (!opened.get()) {
+		if (thread_.joinable())
+			thread_.join();
+		running_ = false;
+		return false;
+	}
 	return true;
 }
 
@@ -110,16 +128,18 @@ void FileEncoder::run()
 	pthread_setname_np(pthread_self(), "vcard-enc");
 
 	CodecPlan plan = plan_for(target_.codec);
-	const char *container = target_.container.empty() ? plan.container
+	const char *container = target_.container.empty() ? plan.format
 							  : target_.container.c_str();
 
 	AVFormatContext *ofmt = nullptr;
 	int err = avformat_alloc_output_context2(&ofmt, nullptr, container,
 						 path_.c_str());
 	if (err < 0 || !ofmt) {
-		last_error_ = "cannot create output context: " + av_err(err);
+		last_error_ = std::string("no muxer for '") + container +
+			      "': " + av_err(err);
 		VLOG_E("[enc] %s", last_error_.c_str());
 		running_ = false;
+		opened_.set_value(false);
 		return;
 	}
 
@@ -131,9 +151,12 @@ void FileEncoder::run()
 	std::vector<uint8_t> l24;
 	std::vector<int32_t> s32;
 
+	/* only ever called before the header is written, i.e. while start()
+	 * is still waiting for the verdict */
 	auto fail = [&](const std::string &msg) {
 		last_error_ = msg;
 		VLOG_E("[enc] %s", msg.c_str());
+		opened_.set_value(false);
 	};
 
 	auto cleanup = [&]() {
@@ -166,10 +189,11 @@ void FileEncoder::run()
 	venc->pix_fmt = plan.pix_fmt;
 	venc->time_base = AVRational{(int)target_.fps_den, (int)target_.fps_num};
 	venc->framerate = AVRational{(int)target_.fps_num, (int)target_.fps_den};
-	venc->colorspace = target_.height >= 2160 ? AVCOL_SPC_BT2020_NCL
-						  : AVCOL_SPC_BT709;
-	venc->color_primaries = target_.height >= 2160 ? AVCOL_PRI_BT2020
-						       : AVCOL_PRI_BT709;
+	/* Tagged BT.709 regardless of raster. The stream's real colorimetry is
+	 * in its SDP, which this recorder does not read yet; guessing BT.2020
+	 * from the frame size would mislabel every UHD SDR source. */
+	venc->colorspace = AVCOL_SPC_BT709;
+	venc->color_primaries = AVCOL_PRI_BT709;
 	venc->color_trc = AVCOL_TRC_BT709;
 	venc->color_range = AVCOL_RANGE_MPEG; /* ST 2110-20 is narrow range */
 	venc->thread_count = 0;
@@ -257,13 +281,34 @@ void FileEncoder::run()
 
 	VLOG_I("[enc] recording to %s (%s, %ux%u)", path_.c_str(),
 	       record_codec_name(target_.codec), target_.width, target_.height);
+	opened_.set_value(true);
 
-	int64_t vpts = 0, apts = 0;
-	const size_t audio_chunk_bytes =
-		(size_t)audio_frame_samples * target_.channels * 3;
+	int64_t vpts = -1, apts = 0;
+	const int64_t frame_ns =
+		(int64_t)1000000000ll * target_.fps_den / target_.fps_num;
+	const size_t sample_bytes = (size_t)target_.channels * 3;
+	const size_t audio_chunk_bytes = (size_t)audio_frame_samples * sample_bytes;
 	l24.resize(audio_chunk_bytes);
 
-	while (running_) {
+	auto encode_audio = [&](int samples) {
+		size_t total = (size_t)samples * target_.channels;
+		bool underrun = false;
+		afifo_.read_exact(l24.data(), (size_t)samples * sample_bytes, &underrun);
+		s32.resize(total);
+		l24be_to_s32(l24.data(), s32.data(), total);
+		av_frame_make_writable(aframe);
+		aframe->nb_samples = samples;
+		memcpy(aframe->data[0], s32.data(), total * 4);
+		aframe->pts = apts;
+		apts += samples;
+		if (avcodec_send_frame(aenc, aframe) == 0)
+			write_packets(aenc, ast);
+	};
+
+	/* No running_ check: stop() closes the queue, and pop() keeps handing
+	 * out what is still in it before it reports the end. Otherwise the
+	 * last third of a second of every take would be thrown away. */
+	for (;;) {
 		VideoFrame vf;
 		if (!vq_.pop(vf))
 			break;
@@ -271,7 +316,8 @@ void FileEncoder::run()
 			break;
 
 		av_frame_make_writable(vframe);
-		if (plan.pix_fmt == AV_PIX_FMT_YUV422P10LE) {
+		if (plan.pix_fmt == AV_PIX_FMT_YUV422P10LE &&
+		    (int)vf.width == venc->width && (int)vf.height == venc->height) {
 			/* identical layout: straight line copies */
 			for (int p = 0; p < 3; p++) {
 				const uint8_t *src = vf.plane(p);
@@ -284,6 +330,8 @@ void FileEncoder::run()
 				}
 			}
 		} else {
+			/* other pixel format, or the source changed raster
+			 * mid-take: the file keeps the size it was opened with */
 			const uint8_t *src[3] = {vf.plane(0), vf.plane(1), vf.plane(2)};
 			int src_stride[3] = {(int)vf.stride[0], (int)vf.stride[1],
 					     (int)vf.stride[2]};
@@ -292,34 +340,44 @@ void FileEncoder::run()
 						   venc->width, venc->height,
 						   venc->pix_fmt, SWS_BICUBIC,
 						   nullptr, nullptr, nullptr);
+			if (!sws)
+				continue;
 			sws_scale(sws, src, src_stride, 0, vf.height, vframe->data,
 				  vframe->linesize);
 		}
-		vframe->pts = vpts++;
+
+		/* The frame's place in the file comes from when it was sampled,
+		 * not from how many we happened to get: a frame lost on the
+		 * wire or dropped under load leaves a gap of the right length,
+		 * and the sound stays where it belongs. pts_ns < 0 means the
+		 * source gave us no usable timestamp; then we can only count. */
+		int64_t slot = vf.pts_ns >= 0 ? (vf.pts_ns + frame_ns / 2) / frame_ns
+					      : vpts + 1;
+		vpts = std::max(slot, vpts + 1);
+		vframe->pts = vpts;
 		if (avcodec_send_frame(venc, vframe) == 0)
 			write_packets(venc, vst);
 		frames_written_++;
 
-		/* Drain whatever audio has accumulated for this frame period.
-		 * Video is the pump: one frame in, roughly one frame's worth of
-		 * audio out. */
-		if (aenc) {
-			while (afifo_.size() >= audio_chunk_bytes) {
-				bool underrun = false;
-				if (!afifo_.read_exact(l24.data(), audio_chunk_bytes,
-						       &underrun))
-					break;
-				size_t total = (size_t)audio_frame_samples *
-					       target_.channels;
-				s32.resize(total);
-				l24be_to_s32(l24.data(), s32.data(), total);
-				av_frame_make_writable(aframe);
-				memcpy(aframe->data[0], s32.data(), total * 4);
-				aframe->pts = apts;
-				apts += audio_frame_samples;
-				if (avcodec_send_frame(aenc, aframe) == 0)
-					write_packets(aenc, ast);
-			}
+		/* Video is the pump: one frame in, whatever whole audio chunks
+		 * have accumulated out. */
+		if (aenc)
+			while (afifo_.size() >= audio_chunk_bytes)
+				encode_audio(audio_frame_samples);
+	}
+
+	/* Tail: write the audio that belongs to the video we have, and no
+	 * more, so both tracks end together. */
+	if (aenc && vpts >= 0) {
+		int64_t want = av_rescale((vpts + 1) * frame_ns, target_.sample_rate,
+					  1000000000);
+		while (apts < want) {
+			int64_t have = (int64_t)(afifo_.size() / sample_bytes);
+			int n = (int)std::min<int64_t>(
+				{want - apts, have, (int64_t)audio_frame_samples});
+			if (n <= 0)
+				break;
+			encode_audio(n);
 		}
 	}
 

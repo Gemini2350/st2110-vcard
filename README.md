@@ -33,6 +33,17 @@ Details und der Weg von Hand: [docs/setup-linux.md](docs/setup-linux.md).
 
 GUI danach auf `http://<host>:8088`.
 
+## Testen
+
+```bash
+tests/run-in-docker.sh
+```
+
+Baut gegen einen MTL-Ersatz (Software-Loopback) und fährt den echten Daemon
+Ende-zu-Ende: abspielen, empfangen, Preview, aufnehmen, Lip-Sync messen, Fehler
+einspeisen. Kein NIC nötig, läuft auch auf dem Mac. Was das abdeckt und was
+nicht: [docs/testing.md](docs/testing.md).
+
 ## API
 
 | Methode | Pfad | Zweck |
@@ -50,6 +61,10 @@ GUI danach auf `http://<host>:8088`.
 | GET | `/api/preview/{player\|recorder}/{name}/mjpeg` | Live-Bild als MJPEG |
 | GET | `/api/preview/{player\|recorder}/{name}/jpeg` | Einzelbild |
 | GET | `/api/log` | letzte Logzeilen |
+
+Im Status pro Player u. a. `frames_repeated`, `audio_underruns`,
+`video_epochs_skipped`, `audio_gap_ms` und `av_skew_ms` (A/V-Versatz am Sender
+laut MTL); pro Recorder `frames_incomplete`, `frames_dropped`, `audio_gap_ms`.
 
 Eingehendes Bild kurz ansehen, ohne GUI:
 

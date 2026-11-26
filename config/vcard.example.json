@@ -50,7 +50,8 @@
       "audio_port": 30000,
       "audio_payload_type": 97,
       "ptime": "1ms",
-      "queue_frames": 8
+      "queue_frames": 8,
+      "av_offset_ms": 0
     }
   ],
 

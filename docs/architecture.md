@@ -31,25 +31,77 @@ mit REST-API und Web-GUI.
 
 **MTL taktet, nicht die Datei und nicht die CPU.**
 
-`st20p_tx_get_frame()` mit `ST20P_TX_FLAG_BLOCK_GET` liefert genau einmal pro
-Frame-Epoch einen Puffer zurück, abgeleitet aus PTP. Genauso `st30p_tx_get_frame()`
-pro Audio-Frameperiode. Die beiden TX-Threads schlafen also nie auf einem Timer –
-sie blockieren im Netz-Stack und werden vom PTP-Takt freigegeben.
+`st20p_tx_get_frame()` mit `ST20P_TX_FLAG_BLOCK_GET` gibt einen Puffer genau dann
+zurück, wenn der vorherige Frame gesendet ist – also einmal pro Frame-Epoch,
+abgeleitet aus PTP. Genauso `st30p_tx_get_frame()` pro Audio-Puffer (10 ms).
+Die beiden TX-Threads schlafen nie auf einem Timer.
+
+Voraussetzung, und leicht zu übersehen: das Device muss **gestartet** sein.
+`mtl_init` allein bewegt kein Paket; ohne `mtl_start()` bzw.
+`MTL_FLAG_DEV_AUTO_START_STOP` bleiben die Sender stumm und `get_frame` läuft
+einmal pro Sekunde in den Timeout. Der Daemon setzt das Flag in
+`MtlDevice`.
 
 Daraus folgt der Rest des Designs:
 
-* Der Decoder läuft **voraus** in die Queues und blockiert, wenn sie voll sind
-  (`BoundedQueue::push`). Eine Datei hat keinen Takt, PTP schon; die Queue
-  absorbiert die Differenz.
-* Läuft die Video-Queue leer, wird das **letzte Bild gehalten** statt einen
-  Epoch auszulassen. Ein Standbild ist für einen Empfänger harmlos, eine Lücke
-  in der RTP-Sequenz nicht. `frames_repeated` zählt das mit.
-* Läuft der Audio-FIFO leer, wird mit **digitaler Stille** aufgefüllt
-  (`AudioFifo::read_exact` blockiert bewusst nie). `audio_underruns` zählt das.
+* Der Decoder läuft **voraus** in die Queues und blockiert, wenn sie voll sind.
+  Eine Datei hat keinen Takt, PTP schon; die Queue absorbiert die Differenz.
+* Die TX-Threads nehmen **nie blockierend** aus der Queue (`try_pop`,
+  `read_exact`). Ein getakteter Thread, der auf den Decoder wartet, verpasst
+  seine Epoche.
 * Auf der RX-Seite gilt das Gegenteil: die Platte darf den Draht nie bremsen.
-  Deshalb `try_push`/`try_write` – wenn der Encoder nicht mitkommt, werden
-  Frames verworfen (`frames_dropped`), statt MTLs Empfangspfad zu blockieren
-  und daraus Paketverlust für alle zu machen.
+  Deshalb `try_push`/`try_write` – kommt der Encoder nicht mit, werden Frames
+  verworfen (`frames_dropped`), statt MTLs Empfangspfad zu blockieren.
+
+## Lip-Sync: drei Mechanismen, die zusammengehören
+
+Raten-Gleichlauf liefert der Takt von selbst. Dass Bild und Ton auch
+*zueinander* stimmen, nicht:
+
+**1. Gemeinsamer Start (Preroll).** Bei jedem neuen Item und nach jedem Seek
+hält der Player das letzte Bild, bis beide Queues gefüllt sind, und gibt dann
+Bild und Ton mit *einer* Entscheidung frei. Der Audio-Thread kommt bis zu einem
+Puffer später dran und überspringt genau diesen Rückstand, damit das erste
+Sample zum ersten Bild passt.
+
+**2. Gleiche Pipeline-Tiefe.** Mit `BLOCK_GET` geht das, was man jetzt füllt,
+`framebuff_cnt` Perioden später raus – 60 ms bei drei Video-Puffern in 50p.
+Die Zahl der Audio-Puffer wird daraus abgeleitet, sonst läuft der Ton um die
+Differenz voraus.
+
+**3. Rückmeldung vom Transport.** MTL meldet im `notify_frame_done` die
+PTP-Zeit, zu der ein Frame tatsächlich rausging. Daraus liest der Player:
+
+* *Lücken*: liegt zwischen zwei Frames mehr als eine Periode, hatte der
+  Transport für eine Epoche nichts zu senden – der Thread war zu spät. Der
+  Inhalt danach ist um genau das verschoben, also wird genau so viel
+  übersprungen. Dasselbe, wenn die Queue leer lief (Bild gehalten / Stille):
+  die Schuld wird später durch Überspringen beglichen. Ohne das addiert sich
+  jeder Aussetzer dauerhaft zum A/V-Versatz.
+* *Versatz*: die Zeiten des ersten Video-Frames und des ersten Audio-Puffers
+  eines Items ergeben den realen A/V-Versatz am Sender. Er steht als
+  `av_skew_ms` im Status und in der GUI.
+
+`av_offset_ms` pro Player trimmt, was eine Messung am echten Netz noch zeigt.
+
+Pause/Resume ist deshalb intern ein Seek auf das gerade gezeigte Bild: die
+beiden Threads halten auf verschiedenen Ticks an, und einfaches Weiterlaufen
+würde Bild und Ton mit jeder Pause etwas weiter auseinanderschieben.
+
+## Dateien haben krumme Zeitstempel
+
+Der Decoder rechnet alles auf eine Zeitachse um, die bei Dateianfang mit null
+beginnt:
+
+* Container-Zeitstempel beginnen selten bei null (Kamerafiles, MXF mit
+  Timecode, Transportströme). Ursprung ist `start_time` des Containers –
+  gemeinsam für beide Essenzen, damit ihr Versatz zueinander erhalten bleibt.
+* Audio wird einmal am Anfang und nach jedem Seek platziert: fängt es später an
+  als das Bild, kommt Stille davor; fängt es früher an (nach einem Seek immer,
+  der landet auf einem Keyframe davor), wird abgeschnitten.
+* Am Dateiende wird der Ton exakt auf die Länge des Bildes gebracht. Dateien
+  sind selten so genau geschnitten, und im Loop würde sich die Differenz mit
+  jedem Durchlauf aufaddieren.
 
 ## Framerate-Konformierung
 
@@ -93,17 +145,37 @@ Damit das den Draht nicht ausbremst:
 Dazu Peak-Pegel pro Kanal (`AudioMeters`) aus demselben Bytestrom, der auf den
 Draht geht bzw. von ihm kommt.
 
+## Aufnahme folgt den Zeitstempeln, nicht der Ankunft
+
+MTL liefert RX-Frames mit dem 32-bit-RTP-Zeitstempel und der PTP-Zeit des ersten
+Pakets. `rx_sample_time_ns()` verankert den RTP-Wert an der Ankunftszeit (er
+läuft sonst alle paar Stunden über, für Video und Audio in verschiedenen
+Perioden) und ergibt den Abtastzeitpunkt auf der PTP-Zeitachse – das Einzige,
+was Bild und Ton einer 2110-Quelle wirklich gemeinsam haben.
+
+* Nullpunkt der Datei ist das erste aufgenommene Bild. Audio wird darauf
+  zugeschnitten oder mit Stille aufgefüllt.
+* Video-PTS kommt aus dem Zeitstempel, nicht aus einem Zähler: ein verlorener
+  oder verworfener Frame hinterlässt eine Lücke der richtigen Länge.
+* Fehlt Audio (Paketverlust, pausierender Sender), wird das Loch als Stille
+  geschrieben. Sonst wäre alles danach zu früh. `audio_gap_ms` zählt mit.
+
 ## Aufnahmeseite: Codecwahl ist die eigentliche Entscheidung
 
 | Format | Datenrate 1080p50 | Datenrate UHDp50 | Anmerkung |
 |---|---|---|---|
 | Unkomprimiert v210 | ~330 MB/s | ~1,3 GB/s | bit-exakt, braucht NVMe-RAID |
-| ProRes 422 HQ | ~25 MB/s | ~90 MB/s | Default, echtzeitfähig |
+| ProRes 422 HQ | ~25 MB/s | ~90 MB/s | Default; `prores_ks` ist ein Software-Encoder – ob er UHDp50 in Echtzeit schafft, hängt an der CPU und ist nicht gemessen |
 | FFV1 | variabel | variabel | verlustfrei, CPU-hungrig |
 | H.264 | klein | klein | nur Sichtungskopie |
 
 Audio wird immer als PCM 24 bit geschrieben – das ist ein Broadcast-Recorder,
 kein Videoplayer.
+
+Ein Aufnahmestart wartet, bis die Datei wirklich offen ist, und meldet sonst den
+Grund (Encoder fehlt im FFmpeg-Build, Verzeichnis nicht schreibbar, Platte
+voll). „REC leuchtet, aber es wird nichts geschrieben" darf ein Recorder nicht
+können.
 
 ## Hardware: was die NIC bestimmt
 
@@ -128,7 +200,28 @@ Für alles andere ist die NIC egal:
 | PTP | NIC mit Hardware-Timestamping (PHC); bei allen Server-NICs dieser Klasse gegeben |
 | UHD | 25G+ und DPDK — der Kernel-Pfad trägt das nicht |
 
+## Was geprüft ist und was nicht
+
+`tests/e2e.sh` lässt den echten Daemon gegen einen MTL-Ersatz laufen
+(`tests/mock-mtl/`, ein Software-Loopback mit dem Verhalten, auf das sich das
+Design stützt): Datei abspielen → Loopback → Preview → Aufnahme, mit Messung
+des Lip-Sync über die ganze Kette und mit eingespeisten Fehlern (ausgelassene
+Epochen, eingefrorener Prozess). Details in [testing.md](testing.md).
+
+**Nicht** geprüft ist alles, was erst mit der echten Bibliothek und einem
+echten Netz existiert: Pacing, PTP-Lock, IGMP, Paketverlust, Durchsatz, und ob
+MTLs reale Pipeline-Latenzen der Annahme aus Punkt 2 oben entsprechen. Dafür ist
+`av_skew_ms` da – der Wert kommt von MTL selbst und lässt sich gegen einen
+Analyzer halten.
+
 ## Bekannte Lücken (bewusst v0)
+
+* **NMOS** ist ungebaut und ungetestet: die Datei ist aus `obs-mtl-st2110`
+  portiert, aber nie gegen `nmos-cpp` kompiliert worden. Deaktivieren
+  (`master_enable: false`) und Unicast werden ignoriert; der Payload-Type kommt
+  aus der Config, nicht aus dem SDP.
+* **Farbmetrik** der Aufnahme ist fest BT.709 getaggt; das SDP des Senders wird
+  nicht gelesen.
 
 * **ST 2110-40 (ANC/Timecode)** fehlt. Für eine „echte" Karte gehört LTC/ST 12-2
   im ANC-Stream dazu; MTL hat die `st40`-API, die Anbindung ist noch nicht

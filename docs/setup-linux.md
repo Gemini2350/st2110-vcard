@@ -23,6 +23,7 @@ er schon erledigt ist.
 | VF-Binding an vfio-pci | nicht nötig | nötig |
 | NIC | beliebig, mit IP | E810/E830 |
 | ST 2110-21 Narrow Pacing | **nein** | ja |
+| PTP | ptp4l auf dem Interface, MTL liest die PHC | MTLs eingebauter Client oder ptp4l |
 | Sinnvoll für | Bring-up, Funktionstest, 1080p | echter Betrieb, UHD |
 
 `--simple` überspringt die drei Schritte, die tatsächlich weh tun, und braucht
@@ -36,6 +37,12 @@ Das reicht, um Files auf eine Multicast-Gruppe zu spielen, eingehendes Video
 anzusehen und aufzunehmen. Was fehlt, ist die harte Paketverteilung im Frame —
 der Kernel-Pfad hält kein Narrow Pacing, und ein 2110-Analyzer wird das
 anmerken. Für „läuft die Kette überhaupt" ist das egal, für eine Abnahme nicht.
+
+PTP im einfachen Modus: der Kernel behält die NIC, also macht `ptp4l` das PTP
+und MTL liest die Hardware-Uhr, die es diszipliniert (`phc_device`). Das Script
+trägt die passende `/dev/ptpN` ein und sagt, wenn `ptp4l` nicht läuft. Ohne
+laufendes `ptp4l` sind die RTP-Zeitstempel freilaufend – für einen Loopback auf
+derselben Kiste egal, gegen fremde Geräte nicht.
 
 Später umsteigen geht ohne Neubau: `--full` laufen lassen und in der Config
 `device.port` von `kernel:enp3s0f0` auf die VF-BDF ändern.
@@ -160,11 +167,16 @@ FetchContent — dafür braucht die Kiste einmal Internet. Ohne Internet
 stattdessen aus der Distribution nehmen (`sudo apt install nlohmann-json3-dev`)
 und die `FetchContent`-Blöcke in `CMakeLists.txt` durch `find_package` ersetzen.
 
-**Erwartung setzen:** die FFmpeg- und HTTP-abhängigen Dateien wurden bisher nie
-kompiliert. Rechne beim ersten Durchlauf mit Fehlern in `media/decoder.cpp`,
-`media/encoder.cpp`, `monitor/preview.cpp` und `api/http-server.cpp` — meist
-Header- oder Signaturkleinigkeiten. Die MTL-abhängigen Dateien sind gegen die
-echten Header geprüft.
+**Stand der Prüfung:** alles ausser dem NMOS-Node kompiliert warnungsfrei
+(GCC 15, FFmpeg 8, gegen die echten MTL-Header) und läuft im Ende-zu-Ende-Test
+gegen einen MTL-Ersatz, siehe [testing.md](testing.md). Gegen die **echte**
+MTL-Bibliothek gelinkt und auf einer NIC gelaufen ist es noch nie — das hier ist
+der erste Versuch. Ubuntu 24.04 bringt FFmpeg 6.1 mit; dagegen ist nicht gebaut
+worden, die verwendeten Aufrufe gibt es aber seit 5.1.
+
+Vor dem ersten Start auf Hardware lohnt der Mock-Test auf derselben Kiste: er
+zeigt, ob FFmpeg-Build, Codecs und Dateipfade stimmen, bevor MTL ins Spiel
+kommt.
 
 ## 7. NMOS (optional)
 

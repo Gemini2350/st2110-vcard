@@ -29,7 +29,11 @@ struct DecoderTarget {
 
 class FileDecoder {
 public:
-	FileDecoder(BoundedQueue<VideoFrame> &vq, AudioFifo &afifo, DecoderTarget target);
+	/* audio_done, if given, is raised once the file has delivered all the
+	 * audio it has: an empty audio queue after that is the end of the
+	 * item, not an underrun. */
+	FileDecoder(BoundedQueue<VideoFrame> &vq, AudioFifo &afifo, DecoderTarget target,
+		    std::atomic<bool> *audio_done = nullptr);
 	~FileDecoder();
 
 	/* Probe a file without starting playback. Returns false if it has no
@@ -55,9 +59,16 @@ public:
 	int64_t duration_ns() const { return duration_ns_; }
 	uint64_t frames_emitted() const { return frames_emitted_; }
 	bool finished() const { return finished_; }
+	/* Whether the current file carries audio we can decode. Known as soon
+	 * as start() returns; the player uses it to decide whether an empty
+	 * audio queue is an underrun or simply a silent file. */
+	bool has_audio() const { return has_audio_; }
 
-	/* Seek request, honoured at the next decode step. */
+	/* Seek request, honoured at the next decode step. seek_serial() goes
+	 * up once the queues have been flushed and decoding continues from
+	 * the new position. */
 	void seek(int64_t position_ns);
+	uint64_t seek_serial() const { return seek_serial_; }
 
 private:
 	void run(std::string path, bool loop);
@@ -66,6 +77,7 @@ private:
 	BoundedQueue<VideoFrame> &vq_;
 	AudioFifo &afifo_;
 	DecoderTarget target_;
+	std::atomic<bool> *audio_done_ = nullptr;
 
 	std::thread thread_;
 	std::atomic<bool> running_{false};
@@ -74,6 +86,11 @@ private:
 	std::atomic<int64_t> duration_ns_{0};
 	std::atomic<int64_t> seek_request_{-1};
 	std::atomic<uint64_t> frames_emitted_{0};
+	std::atomic<bool> has_audio_{false};
+	std::atomic<uint64_t> seek_serial_{0};
+	/* Audio samples a looped file delivered beyond its video length; taken
+	 * off the head of the next pass so loops cannot drift apart. */
+	int64_t loop_audio_excess_ = 0;
 };
 
 } // namespace vcard

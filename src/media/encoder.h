@@ -11,6 +11,7 @@
 #include "core/media-buffer.h"
 
 #include <atomic>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -64,6 +65,7 @@ private:
 	std::string last_error_;
 
 	std::thread thread_;
+	std::promise<bool> opened_;
 	std::atomic<bool> running_{false};
 	std::atomic<uint64_t> frames_written_{0};
 	std::atomic<uint64_t> bytes_written_{0};
