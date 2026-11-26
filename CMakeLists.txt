@@ -93,6 +93,10 @@ target_link_libraries(st2110-vcard PRIVATE
 )
 
 if(ENABLE_NMOS)
+  # nmos-cpp's installed config links nmos-cpp::websocketpp against
+  # websocketpp::websocketpp but does not look for it itself when nmos-cpp was
+  # built against system packages; without this the generate step fails.
+  find_package(websocketpp QUIET)
   find_package(nmos-cpp CONFIG QUIET)
   if(nmos-cpp_FOUND)
     target_sources(st2110-vcard PRIVATE src/nmos/nmos-node.cpp)

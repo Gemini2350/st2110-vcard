@@ -130,7 +130,12 @@ public:
 	 * one, or what "auto" comes to on this device. This is what an SDP
 	 * for the stream has to declare as TP. */
 	enum st21_pacing video_pacing() const;
-	/* Applied on the next open(); a live change restarts the senders. */
+	/* Apply a new configuration. A change of transport only (destination,
+	 * payload type, an essence switched on or off -- what an IS-05
+	 * activation does) restarts the senders and nothing else: the playlist
+	 * keeps running and picks up on the new sessions. A change of raster,
+	 * rate or channel count stops playout; the material has to be decoded
+	 * differently for it. */
 	void reconfigure(const PlayerConfig &config);
 
 	Preview *preview() { return &preview_; }
@@ -139,6 +144,8 @@ public:
 private:
 	bool start_sessions();
 	void stop_sessions();
+	void start_threads();
+	void join_threads();
 	void video_tx_loop();
 	void audio_tx_loop();
 	void start_current_item();

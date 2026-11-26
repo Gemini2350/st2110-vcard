@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <pthread.h>
+#include <thread>
 
 namespace vcard {
 
@@ -89,13 +90,79 @@ enum st21_pacing Player::video_pacing() const
 
 void Player::reconfigure(const PlayerConfig &config)
 {
-	bool was_up = tx_running_;
-	if (was_up)
+	if (!tx_running_) {
+		config_ = config;
+		meters_.configure(config_.channels);
+		return;
+	}
+
+	const bool same_media = config.width == config_.width &&
+				config.height == config_.height &&
+				config.fps == config_.fps &&
+				config.interlaced == config_.interlaced &&
+				config.channels == config_.channels;
+	if (!same_media) {
 		close();
-	config_ = config;
-	meters_.configure(config_.channels);
-	if (was_up)
+		config_ = config;
+		meters_.configure(config_.channels);
 		open();
+		return;
+	}
+
+	/* Transport change: swap the sessions under the running playout. */
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		tx_running_ = false;
+	}
+	join_threads();
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	const bool essences_changed = config.audio_enabled != config_.audio_enabled ||
+				      config.video_enabled != config_.video_enabled;
+	stop_sessions();
+	config_ = config;
+	if (!start_sessions())
+		VLOG_E("[play:%s] senders did not come back after reconfiguration",
+		       config_.name.c_str());
+	/* Whether the decoder delivers audio depends on whether anyone takes
+	 * it; restart the item where it is so it matches the new setup. */
+	if (essences_changed && decoder_ && state_ != State::Idle) {
+		int64_t pos = shown_pts_ns_;
+		start_current_item();
+		if (decoder_) {
+			decoder_->seek(pos);
+			shown_pts_ns_ = pos;
+		}
+	} else {
+		/* same queues, new sessions: line both essences up again */
+		flowing_ = false;
+		preroll_started_ns_ = 0;
+	}
+	tx_running_ = true;
+	start_threads();
+}
+
+void Player::start_threads()
+{
+	/* The video thread always runs. It is the one that releases an item,
+	 * walks the playlist and feeds the preview; without a video session it
+	 * keeps time itself instead of being paced by the transport. */
+	v_thread_ = std::thread(&Player::video_tx_loop, this);
+	if (a_handle_)
+		a_thread_ = std::thread(&Player::audio_tx_loop, this);
+}
+
+void Player::join_threads()
+{
+	/* unblock whoever sits in get_frame() */
+	if (v_handle_)
+		st20p_tx_wake_block(v_handle_);
+	if (a_handle_)
+		st30p_tx_wake_block(a_handle_);
+	if (v_thread_.joinable())
+		v_thread_.join();
+	if (a_thread_.joinable())
+		a_thread_.join();
 }
 
 bool Player::open()
@@ -112,10 +179,7 @@ bool Player::open()
 
 	preview_.start();
 	tx_running_ = true;
-	if (config_.video_enabled)
-		v_thread_ = std::thread(&Player::video_tx_loop, this);
-	if (config_.audio_enabled)
-		a_thread_ = std::thread(&Player::audio_tx_loop, this);
+	start_threads();
 	return true;
 }
 
@@ -127,17 +191,10 @@ void Player::close()
 			return;
 		tx_running_ = false;
 	}
-	/* Unblock the tx threads sitting in get_frame() and join them BEFORE
-	 * touching the decoder: the video tx thread calls advance(), which may
-	 * replace decoder_, so stopping it from here first would race. */
-	if (v_handle_)
-		st20p_tx_wake_block(v_handle_);
-	if (a_handle_)
-		st30p_tx_wake_block(a_handle_);
-	if (v_thread_.joinable())
-		v_thread_.join();
-	if (a_thread_.joinable())
-		a_thread_.join();
+	/* Join the tx threads BEFORE touching the decoder: the video thread
+	 * calls advance(), which may replace decoder_, so stopping it from
+	 * here first would race. */
+	join_threads();
 	if (decoder_)
 		decoder_->stop();
 	preview_.stop();
@@ -352,11 +409,25 @@ int Player::on_audio_done(void *priv, struct st30_frame *frame)
 void Player::video_tx_loop()
 {
 	pthread_setname_np(pthread_self(), "vcard-vtx");
+	const auto period = std::chrono::nanoseconds(mtl_fps_frame_ns(config_.fps));
+	auto next_tick = std::chrono::steady_clock::now();
 
 	while (tx_running_) {
-		struct st_frame *dst = st20p_tx_get_frame(v_handle_);
-		if (!dst)
-			continue; /* woken for shutdown, or the 1 s block timeout */
+		struct st_frame *dst = nullptr;
+		if (v_handle_) {
+			dst = st20p_tx_get_frame(v_handle_);
+			if (!dst)
+				continue; /* woken for shutdown, or the 1 s block timeout */
+		} else {
+			/* No video session (essence switched off): nothing paces
+			 * us, so keep the frame rate by the clock. Playlist,
+			 * audio release and preview carry on as usual. */
+			auto now = std::chrono::steady_clock::now();
+			if (next_tick < now - period * 5 || next_tick > now + period * 5)
+				next_tick = now;
+			next_tick += period;
+			std::this_thread::sleep_until(next_tick);
+		}
 		const uint64_t woke_ns = monotonic_ns();
 		bool first_of_flow = false;
 
@@ -419,14 +490,15 @@ void Player::video_tx_loop()
 			}
 		}
 
-		if (have_held_)
-			copy_to_st_frame(held_frame_, dst);
-
-		uint64_t seq = ++v_put_seq_;
-		if (first_of_flow && consumed_new)
-			v_anchor_seq_ = seq;
-		st20p_tx_put_frame(v_handle_, dst);
-		frames_sent_++;
+		if (dst) {
+			if (have_held_)
+				copy_to_st_frame(held_frame_, dst);
+			uint64_t seq = ++v_put_seq_;
+			if (first_of_flow && consumed_new)
+				v_anchor_seq_ = seq;
+			st20p_tx_put_frame(v_handle_, dst);
+			frames_sent_++;
+		}
 
 		if (have_held_) {
 			const uint8_t *planes[3] = {held_frame_.plane(0),
@@ -554,6 +626,7 @@ void Player::start_current_item()
 	t.height = config_.height;
 	mtl_fps_to_rational(config_.fps, &t.fps_num, &t.fps_den);
 	t.channels = config_.channels;
+	t.audio = config_.audio_enabled;
 
 	decoder_ = std::make_unique<FileDecoder>(vq_, afifo_, t, &item_audio_done_);
 	/* Looping a single item is the decoder's job; looping a playlist is

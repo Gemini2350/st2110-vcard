@@ -29,6 +29,12 @@ struct NmosConfig {
 	std::string registry_address; /* empty = mDNS discovery */
 	int registry_port = 0;
 	int http_port = 0;            /* 0 = nmos-cpp defaults */
+	/* Every NMOS id is derived from one seed, so the node, its senders and
+	 * receivers keep their identity across restarts -- a controller's
+	 * routing and salvos refer to those ids. Given here, or else kept in
+	 * seed_file, which is created on first start. */
+	std::string seed_id;
+	std::string seed_file = "/var/lib/st2110-vcard/nmos-seed";
 };
 
 struct Config {

@@ -208,6 +208,10 @@ Design stützt): Datei abspielen → Loopback → Preview → Aufnahme, mit Mess
 des Lip-Sync über die ganze Kette und mit eingespeisten Fehlern (ausgelassene
 Epochen, eingefrorener Prozess). Details in [testing.md](testing.md).
 
+Der NMOS-Node ist gegen `nmos-cpp` gelinkt und läuft im selben Rahmen gegen
+Sonys Registry (`tests/e2e-nmos.sh`): Registrierung, SDP, Verbinden, Umlegen,
+Trennen, stabile IDs.
+
 **Nicht** geprüft ist alles, was erst mit der echten Bibliothek und einem
 echten Netz existiert: Pacing, PTP-Lock, IGMP, Paketverlust, Durchsatz, und ob
 MTLs reale Pipeline-Latenzen der Annahme aus Punkt 2 oben entsprechen. Dafür ist
@@ -216,10 +220,9 @@ Analyzer halten.
 
 ## Bekannte Lücken (bewusst v0)
 
-* **NMOS** ist ungebaut und ungetestet: die Datei ist aus `obs-mtl-st2110`
-  portiert, aber nie gegen `nmos-cpp` kompiliert worden. Deaktivieren
-  (`master_enable: false`) und Unicast werden ignoriert; der Payload-Type kommt
-  aus der Config, nicht aus dem SDP.
+* **NMOS**: Unicast-Receiver werden ignoriert; mDNS-Discovery und der
+  Zwei-Leg-Betrieb (ST 2022-7) sind ungetestet; eine IS-05-Aktivierung auf einem
+  Receiver beendet eine laufende Aufnahme.
 * **Farbmetrik** der Aufnahme ist fest BT.709 getaggt; das SDP des Senders wird
   nicht gelesen.
 

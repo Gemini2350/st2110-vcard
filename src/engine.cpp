@@ -142,19 +142,50 @@ void Engine::register_nmos()
 	nc.registry_address = config_.nmos.registry_address;
 	nc.registry_port = config_.nmos.registry_port;
 	nc.http_port = config_.nmos.http_port;
+	nc.seed_id = config_.nmos.seed_id;
+	nc.seed_file = config_.nmos.seed_file;
 
-	/* An activation only retargets a session when it carries a complete
-	 * destination. Deactivations (master_enable false) and unicast setups
-	 * arrive with the address empty or null; restarting a session onto
-	 * that would just kill it. */
+	/* What an activation asks for:
+	 *  - rtp_enabled false (master_enable off): take that essence off the
+	 *    wire, resp. leave the group. Everything else keeps running.
+	 *  - enabled with a complete destination: (re)start it there.
+	 *  - enabled without one: a unicast receiver setup, which the sessions
+	 *    here do not do. Ignored rather than restarting onto nothing. */
 	auto usable = [](const vcard_nmos::TransportParams &np, const char *what) {
 		if (np.dest_ip.empty() || !np.dest_port) {
-			VLOG_W("[nmos] %s activation without destination ignored "
-			       "(deactivate / unicast are not handled yet)", what);
+			VLOG_W("[nmos] %s activation without a multicast destination "
+			       "ignored (unicast is not handled yet)", what);
 			return false;
 		}
 		return true;
 	};
+
+	/* Controllers re-send what is already active (and the node activates
+	 * each sender once at startup): none of that may restart a session. */
+	struct Same {
+		bool operator()(const PlayerConfig &a, const PlayerConfig &b) const
+		{
+			return a.video_enabled == b.video_enabled &&
+			       a.audio_enabled == b.audio_enabled &&
+			       a.video_dest_ip == b.video_dest_ip &&
+			       a.video_port == b.video_port &&
+			       a.audio_dest_ip == b.audio_dest_ip &&
+			       a.audio_port == b.audio_port;
+		}
+		bool operator()(const RecorderConfig &a, const RecorderConfig &b) const
+		{
+			return a.video_enabled == b.video_enabled &&
+			       a.audio_enabled == b.audio_enabled &&
+			       a.video_multicast_ip == b.video_multicast_ip &&
+			       a.video_port == b.video_port &&
+			       a.video_source_ip == b.video_source_ip &&
+			       a.video_payload_type == b.video_payload_type &&
+			       a.audio_multicast_ip == b.audio_multicast_ip &&
+			       a.audio_port == b.audio_port &&
+			       a.audio_source_ip == b.audio_source_ip &&
+			       a.audio_payload_type == b.audio_payload_type;
+		}
+	} same_transport;
 
 	auto *node = vcard_nmos::NmosNode::start(nc);
 	if (!node) {
@@ -165,7 +196,7 @@ void Engine::register_nmos()
 
 	/* Local IP of each media port, primary first. With a redundant port
 	 * every endpoint has two IS-05 legs, one per port (ST 2022-7). */
-	std::vector<std::string> media_ips{config_.device.local_ip};
+	std::vector<std::string> media_ips{MtlDevice::instance()->params().local_ip};
 	if (!config_.device.port_r.empty())
 		media_ips.push_back(config_.device.local_ip_r);
 
@@ -207,12 +238,19 @@ void Engine::register_nmos()
 			tp.rtp_enabled = true;
 			node->add_sender(vcard_nmos::EssenceKind::VideoRaw,
 					 c.name + " video", vf, af, media_ips, tp,
-					 [pp, usable](const vcard_nmos::TransportParams &np) {
-						 if (!usable(np, "video sender"))
-							 return;
+					 [pp, usable, same_transport](const vcard_nmos::TransportParams &np) {
 						 PlayerConfig nc2 = pp->config();
-						 nc2.video_dest_ip = np.dest_ip;
-						 nc2.video_port = np.dest_port;
+						 if (!np.rtp_enabled) {
+							 nc2.video_enabled = false;
+						 } else if (usable(np, "video sender")) {
+							 nc2.video_enabled = true;
+							 nc2.video_dest_ip = np.dest_ip;
+							 nc2.video_port = np.dest_port;
+						 } else {
+							 return;
+						 }
+						 if (same_transport(nc2, pp->config()))
+							 return;
 						 pp->reconfigure(nc2);
 					 });
 		}
@@ -224,12 +262,19 @@ void Engine::register_nmos()
 			tp.rtp_enabled = true;
 			node->add_sender(vcard_nmos::EssenceKind::AudioL24,
 					 c.name + " audio", vf, af, media_ips, tp,
-					 [pp, usable](const vcard_nmos::TransportParams &np) {
-						 if (!usable(np, "audio sender"))
-							 return;
+					 [pp, usable, same_transport](const vcard_nmos::TransportParams &np) {
 						 PlayerConfig nc2 = pp->config();
-						 nc2.audio_dest_ip = np.dest_ip;
-						 nc2.audio_port = np.dest_port;
+						 if (!np.rtp_enabled) {
+							 nc2.audio_enabled = false;
+						 } else if (usable(np, "audio sender")) {
+							 nc2.audio_enabled = true;
+							 nc2.audio_dest_ip = np.dest_ip;
+							 nc2.audio_port = np.dest_port;
+						 } else {
+							 return;
+						 }
+						 if (same_transport(nc2, pp->config()))
+							 return;
 						 pp->reconfigure(nc2);
 					 });
 		}
@@ -254,31 +299,45 @@ void Engine::register_nmos()
 		if (c.video_enabled)
 			node->add_receiver(vcard_nmos::EssenceKind::VideoRaw,
 					   c.name + " video", vf, af, media_ips,
-					   [rr, usable](const vcard_nmos::TransportParams &np) {
-						   if (!usable(np, "video receiver"))
-							   return;
+					   [rr, usable, same_transport](const vcard_nmos::TransportParams &np) {
 						   RecorderConfig nc2 = rr->config();
-						   nc2.video_multicast_ip = np.dest_ip;
-						   nc2.video_port = np.dest_port;
-						   nc2.video_source_ip = np.source_ip;
-						   if (np.payload_type)
-							   nc2.video_payload_type =
-								   np.payload_type;
+						   if (!np.rtp_enabled) {
+							   nc2.video_enabled = false;
+						   } else if (usable(np, "video receiver")) {
+							   nc2.video_enabled = true;
+							   nc2.video_multicast_ip = np.dest_ip;
+							   nc2.video_port = np.dest_port;
+							   nc2.video_source_ip = np.source_ip;
+							   if (np.payload_type)
+								   nc2.video_payload_type =
+									   np.payload_type;
+						   } else {
+							   return;
+						   }
+						   if (same_transport(nc2, rr->config()))
+							   return;
 						   rr->reconfigure(nc2);
 					   });
 		if (c.audio_enabled)
 			node->add_receiver(vcard_nmos::EssenceKind::AudioL24,
 					   c.name + " audio", vf, af, media_ips,
-					   [rr, usable](const vcard_nmos::TransportParams &np) {
-						   if (!usable(np, "audio receiver"))
-							   return;
+					   [rr, usable, same_transport](const vcard_nmos::TransportParams &np) {
 						   RecorderConfig nc2 = rr->config();
-						   nc2.audio_multicast_ip = np.dest_ip;
-						   nc2.audio_port = np.dest_port;
-						   nc2.audio_source_ip = np.source_ip;
-						   if (np.payload_type)
-							   nc2.audio_payload_type =
-								   np.payload_type;
+						   if (!np.rtp_enabled) {
+							   nc2.audio_enabled = false;
+						   } else if (usable(np, "audio receiver")) {
+							   nc2.audio_enabled = true;
+							   nc2.audio_multicast_ip = np.dest_ip;
+							   nc2.audio_port = np.dest_port;
+							   nc2.audio_source_ip = np.source_ip;
+							   if (np.payload_type)
+								   nc2.audio_payload_type =
+									   np.payload_type;
+						   } else {
+							   return;
+						   }
+						   if (same_transport(nc2, rr->config()))
+							   return;
 						   rr->reconfigure(nc2);
 					   });
 	}

@@ -1,0 +1,38 @@
+# Build-and-test image with nmos-cpp, for the NMOS end-to-end test.
+#
+# nmos-cpp is built against distribution packages -- no Conan. The two
+# dependencies distributions rarely carry (jwt-cpp, json-schema-validator) come
+# from the copies nmos-cpp ships in third_party. The same recipe, with apt
+# package names, is what docs/setup-linux.md describes for the real host.
+FROM alpine:3.24
+RUN apk add --no-cache g++ make cmake pkgconf git ffmpeg ffmpeg-dev nlohmann-json linux-headers curl jq \
+        boost-dev cpprestsdk-dev websocket++ openssl-dev zlib-dev avahi-dev avahi-compat-libdns_sd
+RUN git clone -q --depth 1 --branch v0.18.3 https://github.com/yhirose/cpp-httplib.git /opt/httplib && \
+    cmake -S /opt/httplib -B /tmp/hb -DHTTPLIB_REQUIRE_OPENSSL=OFF -DHTTPLIB_USE_OPENSSL_IF_AVAILABLE=OFF \
+      -DHTTPLIB_USE_ZLIB_IF_AVAILABLE=OFF -DHTTPLIB_USE_BROTLI_IF_AVAILABLE=OFF >/dev/null && \
+    cmake --install /tmp/hb >/dev/null && rm -rf /tmp/hb
+
+# The commit src/nmos/nmos-node.cpp was last checked against.
+ARG NMOS_CPP_VERSION=16a03fc
+ARG NMOS_CPP_JOBS=2
+RUN mkdir /opt/nmos-cpp && cd /opt/nmos-cpp && \
+    curl -fsSL https://codeload.github.com/sony/nmos-cpp/tar.gz/${NMOS_CPP_VERSION} | tar xz --strip-components=1
+# musl only -- a glibc host (the real target) builds nmos-cpp unpatched:
+#  - the default DNS domain is read through glibc's res_ninit(); use the classic
+#    res_init() interface, which on musl yields an empty domain;
+#  - strerror_r() is the GNU flavour returning char*; musl has the XSI one.
+RUN cd /opt/nmos-cpp/Development && \
+    sed -i -e 's|if (0 == ::res_ninit(&res))|if (0 == ::res_init())|' \
+           -e 's|to_string_t(res.defdname)|to_string_t(_res.defdname)|' \
+           -e 's|::res_nclose(&res);||' cpprest/host_utils.cpp && \
+    sed -i -e 's|strerror_r(errno, error, sizeof(error))|strerror(errno)|' nmos/client_utils.cpp && \
+    grep -q '::res_init()' cpprest/host_utils.cpp && grep -q 'strerror(errno)' nmos/client_utils.cpp
+RUN cd /opt/nmos-cpp/Development && \
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+        -DNMOS_CPP_BUILD_TESTS=OFF -DNMOS_CPP_BUILD_EXAMPLES=ON \
+        -DNMOS_CPP_USE_SUPPLIED_JSON_SCHEMA_VALIDATOR=ON \
+        -DNMOS_CPP_USE_SUPPLIED_JWT_CPP=ON \
+        -DNMOS_CPP_USE_AVAHI=ON
+RUN cd /opt/nmos-cpp/Development && cmake --build build -j${NMOS_CPP_JOBS} && \
+    cmake --install build >/dev/null && \
+    cp build/nmos-cpp-registry /usr/local/bin/ && rm -rf build

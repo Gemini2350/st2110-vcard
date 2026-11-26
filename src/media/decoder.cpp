@@ -137,7 +137,7 @@ bool FileDecoder::start(const std::string &path, bool loop)
 	finished_ = false;
 	position_ns_ = 0;
 	frames_emitted_ = 0;
-	has_audio_ = info.audio_channels > 0;
+	has_audio_ = target_.audio && info.audio_channels > 0;
 	loop_audio_excess_ = 0;
 	seek_request_ = -1;
 	if (audio_done_)
@@ -199,6 +199,8 @@ bool FileDecoder::decode_file(const std::string &path)
 	int aidx = av_find_best_stream(fmt.p, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 	if (vidx < 0)
 		return false;
+	if (!target_.audio)
+		aidx = -1;
 
 	CodecCtx vdec, adec;
 	vdec.p = open_stream(fmt.p, vidx);

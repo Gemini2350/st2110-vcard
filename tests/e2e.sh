@@ -29,7 +29,9 @@ post() { curl -sf -w "%{time_total} POST $1\n" -o "$W/post.out" -X POST -H 'Cont
 fetch(){ curl -sf -w "%{time_total} $1\n" -o "$2" "$API$1" >> "$W/calls.log"; }
 pstat(){ get /api/status | jq -r ".players[0].$1"; }
 rstat(){ get /api/status | jq -r ".recorders[0].$1"; }
-now()  { date +%s.%N; }
+# Not `date +%s.%N`: BusyBox date has no %N, which silently turns every
+# measurement into whole seconds -- and a 6.0 s clip into "6 or 7".
+now()  { cut -d' ' -f1 /proc/uptime; }
 since(){ awk -v a="$1" -v b="$(now)" 'BEGIN{printf "%.2f", b-a}'; }
 wait_idle(){ # wait_idle <timeout_s>
 	i=0
@@ -125,7 +127,7 @@ check "recorder preview is live (changes over time)" sh -c "! cmp -s '$W/r1.jpg'
 pk=$(get /api/status | jq '[.recorders[0].meters[].peak_dbfs]|max')
 check "receive meters show the tone ($pk dBFS)" in_range "$pk" -30 0
 wait_idle 12; el=$(since "$t0")
-check "6 s of 25p plays for ~6 s, not 3 s (took $el s)" in_range "$el" 5.8 6.8
+check "6 s of 25p plays for ~6 s, not 3 s (took $el s)" in_range "$el" 5.9 6.5
 rep=$(pstat frames_repeated); und=$(pstat audio_underruns)
 check "no repeated frames during playout ($rep)" [ "$rep" = 0 ]
 check "no audio underruns during playout ($und)" [ "$und" = 0 ]
@@ -140,7 +142,7 @@ check "picture is moving, not stuck on the first frame" sh -c "! cmp -s '$W/o1.j
 pos=$(pstat position_s)
 check "position is relative to file start ($pos s)" in_range "$pos" 1.2 3.2
 wait_idle 10; el=$(since "$t0")
-check "4 s file ends after ~4 s (took $el s)" in_range "$el" 3.8 4.8
+check "4 s file ends after ~4 s (took $el s)" in_range "$el" 3.9 4.5
 
 echo "== record + lip sync through the whole chain"
 EXT=mov; [ "${CODEC:-v210}" = ffv1 ] && EXT=mkv

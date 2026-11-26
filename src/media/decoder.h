@@ -25,6 +25,9 @@ struct DecoderTarget {
 	uint32_t fps_den = 1;
 	uint16_t channels = 2;
 	uint32_t sample_rate = 48000;
+	/* false: ignore the file's audio altogether. Nobody would take it off
+	 * the queue, and a full audio queue stalls the video with it. */
+	bool audio = true;
 };
 
 class FileDecoder {

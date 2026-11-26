@@ -23,9 +23,11 @@
 
 #include "core/log.h"
 
+#include <fstream>
 #include <map>
 #include <mutex>
 
+#include <nmos/activation_mode.h>
 #include <nmos/channels.h>
 #include <nmos/clock_name.h>
 #include <nmos/colorspace.h>
@@ -60,6 +62,20 @@ struct NmosNode::Impl {
 
 	nmos::id node_id;
 	nmos::id device_id;
+	/* empty = no seed, ids are random */
+	nmos::id seed_id;
+
+	/* Id of a resource. With a seed it depends only on the seed and the
+	 * resource's role and label, so it is the same after every restart;
+	 * labels are unique per daemon (session name + essence). */
+	nmos::id make_id(const char *role, const std::string &label = {}) const
+	{
+		if (seed_id.empty())
+			return nmos::make_id();
+		return nmos::make_repeatable_id(
+			seed_id, utility::s2us(std::string("/x-nmos/st2110-vcard/") +
+					       role + "/" + label));
+	}
 
 	std::mutex mutex;
 	std::map<nmos::id, ActivationCb> callbacks;
@@ -80,6 +96,31 @@ struct NmosNode::Impl {
 };
 
 static NmosNode *g_node = nullptr;
+
+/* The seed: from the config, else from the seed file, which is created on
+ * first use. Returns an empty id when there is nowhere to keep one. */
+static nmos::id load_seed(const NodeConfig &config)
+{
+	if (!config.seed_id.empty())
+		return utility::s2us(config.seed_id);
+	if (config.seed_file.empty())
+		return {};
+	{
+		std::ifstream in(config.seed_file);
+		std::string line;
+		if (in && std::getline(in, line) && line.size() == 36)
+			return utility::s2us(line);
+	}
+	nmos::id fresh = nmos::make_id();
+	std::ofstream out(config.seed_file);
+	if (out << utility::us2s(fresh) << "\n") {
+		VLOG_I("[nmos] new identity, seed kept in %s", config.seed_file.c_str());
+		return fresh;
+	}
+	VLOG_W("[nmos] cannot write %s: NMOS ids will change on every start",
+	       config.seed_file.c_str());
+	return {};
+}
 
 /* --- helpers ---------------------------------------------------------------- */
 
@@ -222,8 +263,9 @@ NmosNode *NmosNode::start(const NodeConfig &config)
 			std::cerr, std::cout, impl->log_model);
 
 		/* node + device resources */
-		impl->node_id = nmos::make_id();
-		impl->device_id = nmos::make_id();
+		impl->seed_id = load_seed(config);
+		impl->node_id = impl->make_id("node");
+		impl->device_id = impl->make_id("device");
 		auto lock = impl->model.write_lock();
 		nmos::insert_resource(
 			impl->model.node_resources,
@@ -258,6 +300,10 @@ NmosNode *NmosNode::start(const NodeConfig &config)
 					connection_resource.data);
 				const auto &legs = nmos::fields::transport_params(active);
 				auto tp = parse_transport_params(legs);
+				/* master_enable is the endpoint's main switch;
+				 * rtp_enabled the per-leg one */
+				tp.rtp_enabled = tp.rtp_enabled &&
+						 nmos::fields::master_enable(active);
 				if (rx_media)
 					tp.payload_type = payload_type_from_transport_file(
 						active, rx_media);
@@ -393,7 +439,7 @@ std::string NmosNode::add_receiver(EssenceKind kind, const std::string &label,
 {
 	(void)vfmt;
 	auto *impl = impl_;
-	auto receiver_id = nmos::make_id();
+	auto receiver_id = impl->make_id("receiver", label);
 	const bool smpte2022_7 = interface_ips.size() > 1;
 
 	auto lock = impl->model.write_lock();
@@ -438,9 +484,9 @@ std::string NmosNode::add_sender(EssenceKind kind, const std::string &label,
 				 ActivationCb cb)
 {
 	auto *impl = impl_;
-	auto source_id = nmos::make_id();
-	auto flow_id = nmos::make_id();
-	auto sender_id = nmos::make_id();
+	auto source_id = impl->make_id("source", label);
+	auto flow_id = impl->make_id("flow", label);
+	auto sender_id = impl->make_id("sender", label);
 	const size_t legs = interface_ips.size() > 1 ? 2 : 1;
 
 	auto lock = impl->model.write_lock();
@@ -582,6 +628,19 @@ std::string NmosNode::add_sender(EssenceKind kind, const std::string &label,
 				utility::s2us(interface_ips[leg]));
 		tp[U("rtp_enabled")] = web::json::value::boolean(true);
 	}
+	/* The player is on the wire from the moment the daemon is up, so the
+	 * sender has to read as active from the start -- with its SDP served
+	 * and IS-04 saying so. Staging an activation due now lets nmos-cpp do
+	 * that through the normal path (resolve "auto", build the SDP, update
+	 * the subscription). It also calls our activation callback with the
+	 * configured destination, which the engine recognises as no change. */
+	staged[nmos::fields::master_enable] = web::json::value::boolean(true);
+	staged[nmos::fields::activation] = web::json::value_of({
+		{nmos::fields::mode,
+		 nmos::activation_modes::activate_scheduled_relative.name},
+		{nmos::fields::requested_time, U("0:0")},
+		{nmos::fields::activation_time, nmos::make_version()},
+	});
 	nmos::insert_resource(impl->model.connection_resources,
 			      std::move(connection_sender));
 

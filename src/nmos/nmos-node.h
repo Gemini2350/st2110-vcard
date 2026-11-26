@@ -66,6 +66,9 @@ struct TransportParams {
 	 * is the configured payload type the SDP advertises (0 = 96 video /
 	 * 97 audio). IS-05 cannot change it, so activations leave it 0. */
 	uint8_t payload_type = 0;
+	/* Whether the endpoint is to run at all: IS-05 master_enable and the
+	 * leg's rtp_enabled, both. False = take the sender off the wire /
+	 * leave the group; the other fields mean nothing then. */
 	bool rtp_enabled = false;
 };
 
@@ -87,6 +90,11 @@ struct NodeConfig {
 	 * so its IP cannot serve the control plane. */
 	std::string host_address;
 	int logging_level = 0;
+	/* Seed all NMOS ids are derived from (a uuid). Empty: taken from
+	 * seed_file, which is written on first start; with neither, the ids
+	 * are random and change on every start. */
+	std::string seed_id;
+	std::string seed_file;
 };
 
 class NmosNode {

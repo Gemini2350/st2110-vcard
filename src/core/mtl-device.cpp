@@ -10,7 +10,11 @@
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,6 +46,25 @@ uint64_t phc_get_time(void * /*priv*/)
 std::atomic<int64_t> g_ptp_delta{0};
 std::atomic<uint64_t> g_ptp_last_sync{0};
 
+std::string interface_ipv4(const std::string &ifname)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return {};
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname.c_str());
+	std::string out;
+	if (ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
+		char buf[INET_ADDRSTRLEN] = {0};
+		auto *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+		if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)))
+			out = buf;
+	}
+	close(fd);
+	return out;
+}
+
 void ptp_sync_notify(void * /*priv*/, struct mtl_ptp_sync_notify_meta *meta)
 {
 	if (!meta)
@@ -72,10 +95,19 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 		VLOG_W("[mtl] '%s' uses the kernel data path: no ST 2110-21 narrow "
 		       "pacing, limited bandwidth. Fine for bring-up and 1080p "
 		       "tests, not for a facility.", params.port.c_str());
-		if (!params.local_ip.empty())
-			VLOG_I("[mtl] ignoring local_ip '%s' -- the address comes "
-			       "from the interface on this backend",
-			       params.local_ip.c_str());
+		/* ...but the rest of the daemon still needs to know it: it is
+		 * the source address in a sender's SDP and what IS-05 "auto"
+		 * resolves to. */
+		std::string ifname = params.port.substr(params.port.find(':') + 1);
+		std::string actual = interface_ipv4(ifname);
+		if (actual.empty()) {
+			VLOG_E("[mtl] interface '%s' has no IPv4 address", ifname.c_str());
+			return;
+		}
+		if (!params.local_ip.empty() && params.local_ip != actual)
+			VLOG_W("[mtl] configured local_ip %s ignored; %s has %s",
+			       params.local_ip.c_str(), ifname.c_str(), actual.c_str());
+		params_.local_ip = actual;
 	} else {
 		if (!parse_ip(params.local_ip, p.sip_addr[MTL_PORT_P])) {
 			VLOG_E("[mtl] invalid local IP '%s'", params.local_ip.c_str());
@@ -157,8 +189,8 @@ MtlDevice::MtlDevice(const Params &params) : params_(params)
 		       params.port.c_str());
 		return;
 	}
-	VLOG_I("[mtl] up on %s (%s%s), clock source: %s", params.port.c_str(),
-	       kernel_path ? "kernel data path" : params.local_ip.c_str(),
+	VLOG_I("[mtl] up on %s (%s%s%s), clock source: %s", params.port.c_str(),
+	       kernel_path ? "kernel data path, " : "", params_.local_ip.c_str(),
 	       params.port_r.empty() ? "" : ", 2022-7 redundant",
 	       clock_source_name().c_str());
 }

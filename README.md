@@ -36,12 +36,14 @@ GUI danach auf `http://<host>:8088`.
 ## Testen
 
 ```bash
-tests/run-in-docker.sh
+tests/run-in-docker.sh         # Medienpfad
+tests/run-in-docker.sh nmos    # dazu NMOS gegen Sonys nmos-cpp-registry
 ```
 
 Baut gegen einen MTL-Ersatz (Software-Loopback) und fährt den echten Daemon
 Ende-zu-Ende: abspielen, empfangen, Preview, aufnehmen, Lip-Sync messen, Fehler
-einspeisen. Kein NIC nötig, läuft auch auf dem Mac. Was das abdeckt und was
+einspeisen; im NMOS-Modus zusätzlich registrieren, per IS-05 verbinden, umlegen
+und trennen. Kein NIC nötig, läuft auch auf dem Mac. Was das abdeckt und was
 nicht: [docs/testing.md](docs/testing.md).
 
 ## API

@@ -204,6 +204,8 @@ bool Config::load(const std::string &path, Config *out, std::string *error)
 			get_or<std::string>(n, "registry_address", c.nmos.registry_address);
 		c.nmos.registry_port = get_or<int>(n, "registry_port", c.nmos.registry_port);
 		c.nmos.http_port = get_or<int>(n, "http_port", c.nmos.http_port);
+		c.nmos.seed_id = get_or<std::string>(n, "seed_id", c.nmos.seed_id);
+		c.nmos.seed_file = get_or<std::string>(n, "seed_file", c.nmos.seed_file);
 	}
 	c.media_dir = get_or<std::string>(j, "media_dir", c.media_dir);
 	c.log_level = get_or<std::string>(j, "log_level", c.log_level);
@@ -244,7 +246,9 @@ bool Config::save(const std::string &path, std::string *error) const
 		     {"host_address", nmos.host_address},
 		     {"registry_address", nmos.registry_address},
 		     {"registry_port", nmos.registry_port},
-		     {"http_port", nmos.http_port}};
+		     {"http_port", nmos.http_port},
+		     {"seed_id", nmos.seed_id},
+		     {"seed_file", nmos.seed_file}};
 	j["media_dir"] = media_dir;
 	j["log_level"] = log_level;
 	j["players"] = json::array();

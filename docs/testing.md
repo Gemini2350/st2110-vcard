@@ -1,8 +1,9 @@
 # Testen ohne NIC
 
 ```bash
-tests/run-in-docker.sh              # v210
+tests/run-in-docker.sh              # Medienpfad, v210
 tests/run-in-docker.sh prores422hq  # oder ffv1, h264
+tests/run-in-docker.sh nmos         # zusätzlich NMOS gegen Sonys Registry
 ```
 
 Baut den Daemon mit `-DVCARD_MOCK_MTL=ON` in einem Container und lässt
@@ -55,12 +56,38 @@ vier Audio-Puffer.
   Aufnahme, deren Datei sich nicht öffnen lässt
 * sauberes Beenden auf SIGTERM
 
+## Der NMOS-Test
+
+`tests/run-in-docker.sh nmos` baut `nmos-cpp` ins Test-Image (beim ersten Mal
+einige Minuten), linkt den NMOS-Node in den Daemon und lässt nach dem
+Medien-Test `tests/e2e-nmos.sh` laufen. Gegenstelle ist Sonys
+`nmos-cpp-registry` im selben Container; der Test spielt Controller:
+
+* **IS-04**: Node, Device, Sources, Flows, Sender, Receiver stehen in der
+  Registry, mit den Namen und Formaten der Sessions
+* ein sendender Player ist ein **aktiver** Sender, sein SDP wird ausgeliefert
+  und enthält Gruppe, Port, Payload-Type, Raster, Rate, `TP=`, Source-Filter
+* **Receiver verbinden wie ein Controller**: das SDP des Senders wird per PATCH
+  auf den Receiver gelegt. Der Recorder steht vorher auf einer Gruppe, auf der
+  niemand sendet – dass er danach Bild und Ton hat, beweist den Weg von IS-05
+  bis in die Session
+* der Payload-Type kommt aus dem SDP; eine Aktivierung ohne SDP lässt ihn stehen
+* **Sender umlegen**: neues Ziel per PATCH, der Player sendet dorthin, sein SDP
+  folgt, die Wiedergabe läuft weiter
+* **Trennen**: `master_enable: false` auf Receiver und Sender
+* **IDs sind nach einem Neustart dieselben**
+* sauberes Beenden mit laufendem Node
+
+Nicht abgedeckt: mDNS-Discovery (die Registry ist per Adresse vorgegeben),
+ST 2022-7 mit zwei Legs, die AMWA-Testsuite, ein echter Controller. Im
+Alpine-Image braucht `nmos-cpp` zwei kleine musl-Patches (im Dockerfile
+kommentiert); auf einem glibc-Host baut es unverändert.
+
 ## Was er nicht prüfen kann
 
 Alles Netzseitige: ST 2110-21-Pacing, PTP, IGMP, Paketverlust, Durchsatz,
 2022-7. Und ob die echte Bibliothek sich in jedem Punkt so verhält wie der Mock
-– der ist aus MTLs Quelltext abgeleitet, aber ein Nachbau. NMOS ist gar nicht
-abgedeckt.
+– der ist aus MTLs Quelltext abgeleitet, aber ein Nachbau.
 
 Zeitgrenzen sind für eine kleine VM gewählt. Auf einer überlasteten Maschine
 können einzelne Zeitchecks kippen, ohne dass etwas kaputt ist; die Ausgabe nennt

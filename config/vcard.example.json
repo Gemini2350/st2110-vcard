@@ -29,7 +29,9 @@
     "host_address": "10.0.0.20",
     "registry_address": "registry.example.com",
     "registry_port": 8010,
-    "http_port": 0
+    "http_port": 0,
+    "seed_id": "",
+    "seed_file": "/var/lib/st2110-vcard/nmos-seed"
   },
 
   "players": [

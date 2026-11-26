@@ -180,21 +180,59 @@ kommt.
 
 ## 7. NMOS (optional)
 
-`nmos-cpp` bauen und installieren, dann greift `-DENABLE_NMOS=ON` (Default).
-Wird `nmos-cpp` nicht gefunden, baut CMake mit einer Warnung ohne NMOS weiter —
-alles andere funktioniert dann trotzdem.
+`nmos-cpp` lässt sich ohne Conan gegen Distributionspakete bauen; die zwei
+Abhängigkeiten, die Distributionen selten mitbringen (jwt-cpp,
+json-schema-validator), liefert es selbst mit:
 
-`nmos-cpp` benennt zwischen Tags gelegentlich Helper um. `src/nmos/nmos-node.cpp`
-ist die Datei, die dann kleine Anpassungen braucht; deshalb einen Tag pinnen und
-notieren, welchen. Zuletzt geprüft gegen `nmos-cpp` master `16a03fc`
-(2026-11-19): die Datei übersteht dort einen Syntax-Only-Compile. Gelinkt und
-gegen eine Registry oder einen Controller gelaufen ist der Node noch nie.
+```bash
+sudo apt install -y libboost-all-dev libcpprest-dev libwebsocketpp-dev \
+  libssl-dev libavahi-compat-libdnssd-dev
+git clone https://github.com/sony/nmos-cpp.git && cd nmos-cpp
+git checkout 16a03fc
+cmake -S Development -B build -DCMAKE_BUILD_TYPE=Release \
+  -DNMOS_CPP_BUILD_TESTS=OFF -DNMOS_CPP_BUILD_EXAMPLES=OFF \
+  -DNMOS_CPP_USE_SUPPLIED_JSON_SCHEMA_VALIDATOR=ON \
+  -DNMOS_CPP_USE_SUPPLIED_JWT_CPP=ON -DNMOS_CPP_USE_AVAHI=ON
+cmake --build build -j$(nproc) && sudo cmake --install build
+```
+
+Danach findet `cmake` für st2110-vcard `nmos-cpp` von selbst
+(`-DENABLE_NMOS=ON` ist Default, in der Ausgabe steht „NMOS node: enabled").
+Wird es nicht gefunden, baut CMake mit einer Warnung ohne NMOS weiter.
+
+`16a03fc` (2026-11-19) ist der Stand, gegen den der Node gebaut **und
+getestet** ist: `tests/run-in-docker.sh nmos` linkt ihn in den Daemon und fährt
+`tests/e2e-nmos.sh` gegen Sonys `nmos-cpp-registry`, siehe
+[testing.md](testing.md). Die Paketnamen oben sind die von Ubuntu 24.04 und
+dort nicht ausprobiert; gebaut wurde im Test-Container (Alpine) mit denselben
+CMake-Optionen. `nmos-cpp` benennt zwischen Ständen gelegentlich Helper um —
+bei einem anderen Commit braucht `src/nmos/nmos-node.cpp` dann kleine
+Anpassungen.
+
+Was der Node tut:
+
+* **Identität**: alle IDs leiten sich aus einem Seed ab (`nmos.seed_id`, sonst
+  `nmos.seed_file`, das beim ersten Start angelegt wird). Node, Sender und
+  Receiver behalten ihre IDs über Neustarts — Routing und Salvos im Controller
+  hängen daran. Wer die Kiste klont, muss die Seed-Datei löschen.
+* **Sender** sind ab Start aktiv und liefern ihr SDP, denn der Player ist ab
+  Start auf dem Draht. Ein IS-05-Retarget tauscht nur die Sessions; die Playlist
+  läuft weiter. `master_enable: false` nimmt die Essenz vom Draht.
+* **Receiver** folgen dem SDP des Controllers: Gruppe, Port, Source-Filter und
+  Payload-Type. `master_enable: false` verlässt die Gruppe. Eine Aktivierung,
+  die nichts ändert, startet nichts neu.
+* **Registry**: `nmos.registry_address`/`registry_port` fest, sonst mDNS — der
+  mDNS-Weg ist ungetestet.
 
 Auf einem redundanten Device (`port_r` gesetzt) hat jeder Sender und Receiver
 zwei IS-05-Legs, und das SDP eines Senders zwei `m=`-Abschnitte
 (`a=group:DUP`). Die Sessions legen beide Legs auf dasselbe Ziel; verlangt ein
 Controller auf dem zweiten Leg eine andere Gruppe, Quelle oder einen anderen
-Port, gilt das erste Leg und der Node loggt eine Warnung.
+Port, gilt das erste Leg und der Node loggt eine Warnung. Das ist kompiliert,
+aber nicht getestet.
+
+Nicht unterstützt: Unicast-Receiver, IS-05 Bulk ist nmos-cpp-Standard und
+ungetestet, eine Aktivierung während einer laufenden Aufnahme beendet den Take.
 
 ## 8. PTP
 

@@ -64,6 +64,8 @@ json player_json(Player *p)
 		      (p->config().interlaced ? "i" : "p") +
 		      mtl_fps_name(p->config().fps);
 	j["channels"] = p->config().channels;
+	j["video_payload_type"] = p->config().video_payload_type;
+	j["audio_payload_type"] = p->config().audio_payload_type;
 	j["meters"] = meters_json(p->meters());
 
 	json pl = json::array();
@@ -98,6 +100,9 @@ json recorder_json(Recorder *r)
 	j["last_error"] = s.last_error;
 	j["video_source"] = s.video_source;
 	j["audio_source"] = s.audio_source;
+	j["video_payload_type"] = r->config().video_payload_type;
+	j["audio_payload_type"] = r->config().audio_payload_type;
+	j["video_source_ip"] = r->config().video_source_ip;
 	j["codec"] = record_codec_name(r->config().codec);
 	j["channels"] = r->config().channels;
 	j["meters"] = meters_json(r->meters());
