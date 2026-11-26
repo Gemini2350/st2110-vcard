@@ -74,12 +74,15 @@ Eingehendes Bild kurz ansehen, ohne GUI:
 curl -s http://host:8088/api/preview/recorder/recorder1/jpeg > frame.jpg
 ```
 
-## Verwandt
+## Voraussetzungen
 
-Teilt Kern-Code mit [obs-mtl-st2110](../obs-mtl-st2110) (MTL-Device,
-Format-Mapping, NMOS-Node). Beide sollten sich das perspektivisch als
-gemeinsame Bibliothek teilen.
+Die Skripte erwarten einen Checkout der
+[Media Transport Library](https://github.com/OpenVisualCloud/Media-Transport-Library)
+neben diesem Repo (`../Media-Transport-Library`) oder den Pfad in `MTL_DIR`
+bzw. `--mtl-dir`.
 
 ## Lizenz
 
-GPL-2.0-or-later.
+GPL-2.0-or-later, siehe [LICENSE](LICENSE). Mit eingebundenem NMOS-Node wird
+gegen `nmos-cpp` (Apache-2.0) gelinkt; Apache-2.0 verträgt sich mit der GPL erst
+ab Version 3, ein solches Binary lässt sich also nur unter GPL-3.0 weitergeben.

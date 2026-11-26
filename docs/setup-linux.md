@@ -250,7 +250,7 @@ sudo ptp4l -i enp75s0f0 -m -H -f /etc/linuxptp/gPTP.cfg
 sudo phc2sys -a -r -m
 ```
 
-Gegen den GM im Büronetz prüfen; Lock-Status und Offset stehen oben in der GUI.
+Gegen den Grandmaster im Netz prüfen; Lock-Status und Offset stehen oben in der GUI.
 
 ## 9. Konfigurieren und starten
 
