@@ -81,6 +81,12 @@ Player::Player(PlayerConfig config)
 
 Player::~Player() { close(); }
 
+enum st21_pacing Player::video_pacing() const
+{
+	auto *dev = MtlDevice::instance();
+	return resolve_pacing(config_.pacing, dev && dev->kernel_data_path());
+}
+
 void Player::reconfigure(const PlayerConfig &config)
 {
 	bool was_up = tx_running_;

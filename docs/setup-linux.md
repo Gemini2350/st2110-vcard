@@ -186,7 +186,15 @@ alles andere funktioniert dann trotzdem.
 
 `nmos-cpp` benennt zwischen Tags gelegentlich Helper um. `src/nmos/nmos-node.cpp`
 ist die Datei, die dann kleine Anpassungen braucht; deshalb einen Tag pinnen und
-notieren, welchen.
+notieren, welchen. Zuletzt geprüft gegen `nmos-cpp` master `16a03fc`
+(2026-11-19): die Datei übersteht dort einen Syntax-Only-Compile. Gelinkt und
+gegen eine Registry oder einen Controller gelaufen ist der Node noch nie.
+
+Auf einem redundanten Device (`port_r` gesetzt) hat jeder Sender und Receiver
+zwei IS-05-Legs, und das SDP eines Senders zwei `m=`-Abschnitte
+(`a=group:DUP`). Die Sessions legen beide Legs auf dasselbe Ziel; verlangt ein
+Controller auf dem zweiten Leg eine andere Gruppe, Quelle oder einen anderen
+Port, gilt das erste Leg und der Node loggt eine Warnung.
 
 ## 8. PTP
 

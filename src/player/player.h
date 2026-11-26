@@ -126,6 +126,10 @@ public:
 	Status status() const;
 
 	const PlayerConfig &config() const { return config_; }
+	/* ST 2110-21 pacing the video session is created with: the configured
+	 * one, or what "auto" comes to on this device. This is what an SDP
+	 * for the stream has to declare as TP. */
+	enum st21_pacing video_pacing() const;
 	/* Applied on the next open(); a live change restarts the senders. */
 	void reconfigure(const PlayerConfig &config);
 

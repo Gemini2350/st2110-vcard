@@ -146,10 +146,7 @@ void Engine::register_nmos()
 	/* An activation only retargets a session when it carries a complete
 	 * destination. Deactivations (master_enable false) and unicast setups
 	 * arrive with the address empty or null; restarting a session onto
-	 * that would just kill it. The payload type is deliberately left as
-	 * configured: it travels in the SDP, which the node does not hand us,
-	 * and overwriting it with a default silently breaks any stream that
-	 * is not on 96. */
+	 * that would just kill it. */
 	auto usable = [](const vcard_nmos::TransportParams &np, const char *what) {
 		if (np.dest_ip.empty() || !np.dest_port) {
 			VLOG_W("[nmos] %s activation without destination ignored "
@@ -166,6 +163,12 @@ void Engine::register_nmos()
 	}
 	nmos_up_ = true;
 
+	/* Local IP of each media port, primary first. With a redundant port
+	 * every endpoint has two IS-05 legs, one per port (ST 2022-7). */
+	std::vector<std::string> media_ips{config_.device.local_ip};
+	if (!config_.device.port_r.empty())
+		media_ips.push_back(config_.device.local_ip_r);
+
 	/* Players are senders; the IS-05 activation retargets the ST 2110
 	 * session, which is exactly what a controller expects to be able to
 	 * do to a playout device. */
@@ -176,21 +179,35 @@ void Engine::register_nmos()
 		vf.height = c.height;
 		mtl_fps_to_rational(c.fps, &vf.fps_num, &vf.fps_den);
 		vf.interlaced = c.interlaced;
+		/* the SDP declares the pacing the session really runs with */
+		switch (p->video_pacing()) {
+		case ST21_PACING_WIDE:
+			vf.pacing = vcard_nmos::VideoFormat::Pacing::Wide;
+			break;
+		case ST21_PACING_LINEAR:
+			vf.pacing = vcard_nmos::VideoFormat::Pacing::NarrowLinear;
+			break;
+		default:
+			vf.pacing = vcard_nmos::VideoFormat::Pacing::Narrow;
+			break;
+		}
 		vcard_nmos::AudioFormat af;
 		af.channels = c.channels;
 		af.ptime_us = ptime_us(c.ptime);
 
+		/* A sender's payload type is ours to choose: it goes into the
+		 * SDP below and IS-05 has no way to change it, so the
+		 * activations leave the configured one alone. */
 		Player *pp = p.get();
 		if (c.video_enabled) {
 			vcard_nmos::TransportParams tp;
-			tp.source_ip = config_.device.local_ip;
 			tp.dest_ip = c.video_dest_ip;
 			tp.dest_port = c.video_port;
 			tp.payload_type = c.video_payload_type;
 			tp.rtp_enabled = true;
 			node->add_sender(vcard_nmos::EssenceKind::VideoRaw,
-					 c.name + " video", vf, af, tp,
-					 [pp](const vcard_nmos::TransportParams &np) {
+					 c.name + " video", vf, af, media_ips, tp,
+					 [pp, usable](const vcard_nmos::TransportParams &np) {
 						 if (!usable(np, "video sender"))
 							 return;
 						 PlayerConfig nc2 = pp->config();
@@ -201,14 +218,13 @@ void Engine::register_nmos()
 		}
 		if (c.audio_enabled) {
 			vcard_nmos::TransportParams tp;
-			tp.source_ip = config_.device.local_ip;
 			tp.dest_ip = c.audio_dest_ip;
 			tp.dest_port = c.audio_port;
 			tp.payload_type = c.audio_payload_type;
 			tp.rtp_enabled = true;
 			node->add_sender(vcard_nmos::EssenceKind::AudioL24,
-					 c.name + " audio", vf, af, tp,
-					 [pp](const vcard_nmos::TransportParams &np) {
+					 c.name + " audio", vf, af, media_ips, tp,
+					 [pp, usable](const vcard_nmos::TransportParams &np) {
 						 if (!usable(np, "audio sender"))
 							 return;
 						 PlayerConfig nc2 = pp->config();
@@ -220,7 +236,9 @@ void Engine::register_nmos()
 	}
 
 	/* Recorders are receivers: a controller points them at a sender and
-	 * the multicast join follows. */
+	 * the multicast join follows. The payload type comes from the SDP of
+	 * the activation; an activation by transport params alone carries
+	 * none (0), and the configured one stays. */
 	for (auto &r : recorders_) {
 		const auto &c = r->config();
 		vcard_nmos::VideoFormat vf;
@@ -235,26 +253,32 @@ void Engine::register_nmos()
 		Recorder *rr = r.get();
 		if (c.video_enabled)
 			node->add_receiver(vcard_nmos::EssenceKind::VideoRaw,
-					   c.name + " video", vf, af,
-					   [rr](const vcard_nmos::TransportParams &np) {
+					   c.name + " video", vf, af, media_ips,
+					   [rr, usable](const vcard_nmos::TransportParams &np) {
 						   if (!usable(np, "video receiver"))
 							   return;
 						   RecorderConfig nc2 = rr->config();
 						   nc2.video_multicast_ip = np.dest_ip;
 						   nc2.video_port = np.dest_port;
 						   nc2.video_source_ip = np.source_ip;
+						   if (np.payload_type)
+							   nc2.video_payload_type =
+								   np.payload_type;
 						   rr->reconfigure(nc2);
 					   });
 		if (c.audio_enabled)
 			node->add_receiver(vcard_nmos::EssenceKind::AudioL24,
-					   c.name + " audio", vf, af,
-					   [rr](const vcard_nmos::TransportParams &np) {
+					   c.name + " audio", vf, af, media_ips,
+					   [rr, usable](const vcard_nmos::TransportParams &np) {
 						   if (!usable(np, "audio receiver"))
 							   return;
 						   RecorderConfig nc2 = rr->config();
 						   nc2.audio_multicast_ip = np.dest_ip;
 						   nc2.audio_port = np.dest_port;
 						   nc2.audio_source_ip = np.source_ip;
+						   if (np.payload_type)
+							   nc2.audio_payload_type =
+								   np.payload_type;
 						   rr->reconfigure(nc2);
 					   });
 	}
